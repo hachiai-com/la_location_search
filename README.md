@@ -17,6 +17,7 @@ la_location_search/
 
 - **cognito**: `token_url` (or `cognito_domain`), `client_id`, `client_secret`, `scope` for OAuth2 client_credentials.
 - **location_api**: `search_url` for the location/search API.
+- **shipment_api** (optional): When present, each built payload is POSTed to the shipment create API. Use `region`, `service`, `baseUrl`, `apiKey`, `accessKey`, `secretKey` (AWS4Auth + x-api-key). Same contract as ShipmentUtility: POST JSON to `baseUrl`.
 - **csv_columns** (optional): Override CSV column names (see mapping below).
 
 The token is requested **on every run** because it expires in 1 hour.
@@ -70,13 +71,13 @@ When `location_type` is omitted or set to `"both"`, **one execution runs both Pi
    CSV must have: `vendorno`, `shipfrom_street`, `shipto_street`, `template_flag`, `description`, `monday_group_name`, `consignee`.
 
    ```powershell
-   echo '{"capability": "location_search", "args": {"csv_path": "C:\\Users\\neeha\\Downloads\\test_data.csv", "transit_time_xlsx_path": "C:\\path\\to\\Transit Time - BOT (PROD).xlsx", "origins_destinations_xlsx_path": "C:\\path\\to\\Origins & Destinations - BOT (PROD).xlsx"}}' | python main.py
+   echo '{"capability":"location_search","args":{"csv_path":"C:\\Users\\neeha\\Downloads\\test_data.csv","transit_time_xlsx_path":"C:\\path\\to\\Transit Time - BOT (PROD).xlsx"}}' | python main.py
    ```
 
-   For **Pepsi** rows (when `template_flag` is "Pepsi"), pass the Pepsi mode sheet so `service.mode` is looked up from it:
+   To write an **output CSV** with one row per payload (request/response, description, PO, vendor, dates, weight, cube, origin/destination, customer/client, mode, service, temperature, API call result):
 
    ```powershell
-   echo '{"capability": "location_search", "args": {"csv_path": "C:\\Users\\neeha\\Downloads\\test_data.csv", "transit_time_xlsx_path": "C:\\path\\to\\Transit Time - BOT (PROD).xlsx", "origins_destinations_xlsx_path": "C:\\path\\to\\Origins & Destinations - BOT (PROD).xlsx", "pepsi_sheet_path": "C:\\path\\to\\Pepsi Altruos (PROD).xlsx"}}' | python main.py
+   echo '{"capability":"location_search","args":{"csv_path":"C:\\...\\test_data.csv","transit_time_xlsx_path":"C:\\...\\Transit Time - BOT (PROD).xlsx","output_csv_path":"C:\\...\\output_sheet.csv"}}' | python main.py
    ```
 
 4. **Run only Pickup or only Delivery**
@@ -101,8 +102,10 @@ When `location_type` is omitted or set to `"both"`, **one execution runs both Pi
   - `error`: `null` or an error message for that row
 - **Failure**: JSON with `error` and `capability` (e.g. missing config, CSV not found, wrong columns, auth failure).
 - When running both, output also includes:
-  - `result.payloads`: one shipment payload per CSV row
-  - `result.payload_setup_errors`: present if the holiday list or mode matrix could not be loaded
+  - `result.payloads`: one shipment payload per CSV row. If **shipment_api** is in config, each item has `create_response`: `{ status_code, body, success, message }` from the shipment create API.
+  - `result.payload_setup_errors`: present if the holiday list could not be loaded
+  - `result.output_csv_path`: set when `output_csv_path` was provided and the file was written successfully
+  - `result.output_csv_error`: set if writing the output CSV failed
 
 ## Example response (run both)
 
@@ -160,7 +163,7 @@ When running both Pickup and Delivery, the response includes both `locations` an
 }
 ```
 
-**Two payload types:** Rows with `template_flag` = "Pepsi" get a **Pepsi** payload (description "Shipment Creation by BOT (PEPSI)", `customer_shipment`, `invoice_reference`, `dates.pickup_appointment`, `service.mode` from Pepsi Modes sheet when `pepsi_sheet_path` is provided). All other rows get the **non-Pepsi** payload (description "Shipment Creation by BOT", `service.mode` from Origins & Destinations Modes sheet). Each payload entry includes `payload_type`: `"pepsi"` or `"non_pepsi"`.
+**Two payload types:** Rows with `template_flag` = "Pepsi" get a **Pepsi** payload (description "Shipment Creation by BOT (PEPSI)", `customer_shipment`, `invoice_reference`, `dates.pickup_appointment`). All other rows get the **non-Pepsi** payload (description "Shipment Creation by BOT"). Both use the same hardcoded Origin×Destination table for `service.mode`. Each payload entry includes `payload_type`: `"pepsi"` or `"non_pepsi"`.
 
 **Payload mapping (non-Pepsi):**
 - `purchase_order`: CSV column `po`
@@ -169,15 +172,37 @@ When running both Pickup and Delivery, the response includes both `locations` an
 - `quantities.declared.*`: CSV columns `weight`, `cubes`, `cases`, `lifts`, `pallets`
 - `locations.origin`: `id` from Pickup result; `locations.destination`: `company_id` from Pickup result
 - `parties.customer`: `id` from Delivery result; `parties.client`: `company_id` from Delivery result
-- `service.mode`: from Origins & Destinations Modes sheet (pickup province × delivery province)
-- `service.temperature`: "FROZEN" (placeholder; calculation TBD)
+- `service.mode`: from hardcoded Origin×Destination table (ROAD within Eastern or within Western; RAIL between Eastern and Western)
+- `service.temperature`: From CSV column **shipment_type** (short code) mapped to Temp Range: (FROZ)→FROZEN, (GROC)→DRY, (DAIR)/(MEAT)/(YGRT)/(FSMT)→FRESH, (REPK)/(GRPK)→DRY. **Exception:** for `monday_group_name` = "NPOP (LA3)/{SOBEYSMIF}.pdf" or "NPOP (LA6)/{MIFLAOPS}.pdf" when `shipment_type` is NULL, temperature is taken from the **Pickup** API result’s commodities: if the location has exactly one `temperature_requirement`, that value is used; if multiple, the temperature key is omitted from the payload.
 
-**Payload mapping (Pepsi):** Same as above, plus: `description` = "Shipment Creation by BOT (PEPSI)"; `customer_shipment` and `dates.pickup_appointment` from CSV column `pickApptNo` (CN Customer Reference #; column name may be updated); `invoice_reference` from CSV column `invoiceRef`; `service.mode` from **Pepsi Altruos (PROD).xlsx** sheet "Modes" when `pepsi_sheet_path` is provided; `service.temperature` = "DRY" (placeholder; calculation TBD).
+**Payload mapping (Pepsi):** Same as above, plus: `description` = "Shipment Creation by BOT (PEPSI)"; `customer_shipment` and `dates.pickup_appointment` from CSV column **pickApptNo**; `invoice_reference` from CSV column **invoiceRef**; `service.mode` from same hardcoded Origin×Destination table; `service.temperature` from CSV column **temp**.
 
-## Checklist
+## Output CSV (output_sheet.csv)
 
-- [x] toolkit.json has correct slug and capability
-- [x] main.py reads JSON from stdin and writes JSON to stdout
-- [x] capability returns JSON with `result` or `error`
-- [x] requirements.txt lists dependencies
-- [x] Credentials in config.json; token obtained on each run (1 hr expiry)
+When `output_csv_path` is provided, one row per payload is written with these columns:
+
+| Output column | Source |
+|---------------|--------|
+| Item ID | Input CSV `item_id` |
+| JSON Request | Payload sent to shipment create API (JSON string) |
+| JSON Response | Response body from shipment create API |
+| Description | Input CSV `description` |
+| Purchase Order | Input CSV `po` |
+| Vendor # | Input CSV `vendorno` |
+| Pick Up Date | Payload `dates.pickup_date` |
+| Delivery Date | Payload `dates.delivery_date` |
+| Weight | Input CSV `weight` |
+| Cube | Input CSV `cubes` |
+| Lifts | Input CSV `lifts` |
+| Pallets | Input CSV `pallets` |
+| Origin / Load At | Payload `locations.origin` |
+| Destination / Delivery Location | Payload `locations.destination` |
+| Customer / PickUp Company | Payload `parties.customer` |
+| Client / Consignee | Payload `parties.client` |
+| Mode | Payload `service.mode` |
+| Service | Payload `service.service` |
+| Temperature | Payload `service.temperature` |
+| API Call Result | Shipment API result message (success, error, skipped, or "Not sent" if API not configured) |
+| Status | One of: In Queue, Created, PO already exists in Altruos, Retry; or error statuses (Vendor # Missing, Dest. Missing, PICKUP/DELIVERY Date Missing, Cube/Weight/Cases Missing, Missing Temp, Missing Mode, JSON not sent, Customer Missing, ERROR); or Pepsi-specific (Pallets/Load Number/Client/Order # Missing (Pepsi)). Populated from validation and API result. |
+| Load Number (Pepsi) | Input CSV `invoiceRef` (Pepsi rows only; empty for non-Pepsi) |
+| Order # (Pepsi) | Input CSV `po` (Pepsi rows only; empty for non-Pepsi) |
