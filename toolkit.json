@@ -37,15 +37,11 @@
           },
           "transit_time_xlsx_path": {
             "type": "string",
-            "description": "Absolute path to 'Transit Time - BOT (PROD).xlsx' (used to adjust pickup_date from Holidays sheet). Required for payload date adjustment."
+            "description": "Absolute path to 'Transit Time - BOT (PROD).xlsx' (Holidays sheet). Required for payload date adjustment when running both."
           },
-          "origins_destinations_xlsx_path": {
+          "output_csv_path": {
             "type": "string",
-            "description": "Absolute path to 'Origins & Destinations - BOT (PROD).xlsx' (used to compute service.mode from Modes sheet). Required for payload mode mapping."
-          },
-          "pepsi_sheet_path": {
-            "type": "string",
-            "description": "Optional. Absolute path to 'Pepsi Altruos (PROD).xlsx' (Modes sheet). Used for service.mode when template_flag is Pepsi."
+            "description": "Optional. When running both: write one row per payload to this CSV (Item ID, JSON Request, JSON Response, Description, PO, Vendor #, dates, quantities, origin/destination, parties, service, API Call Result, etc.)."
           }
         },
         "required": ["csv_path"]
