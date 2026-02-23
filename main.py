@@ -606,9 +606,36 @@ OUTPUT_CSV_COLUMNS = [
     "Service",
     "Temperature",
     "API Call Result",
+    "Status",
     "Load Number (Pepsi)",
     "Order # (Pepsi)",
 ]
+
+# Status values for output CSV (normal, error, Pepsi-specific)
+STATUS_IN_QUEUE = "In Queue"
+STATUS_CREATED = "Created"
+STATUS_UPDATED_SHIPMENT = "Updated Shipment"
+STATUS_RETRY = "Retry"
+STATUS_PO_ALREADY_EXISTS = "PO already exists in Altruos"
+STATUS_VENDOR_MISSING = "Vendor # Missing (ERROR)"
+STATUS_DEST_MISSING = "Dest. Missing (ERROR)"
+STATUS_PICKUP_DATE_MISSING = "PICKUP Date Missing (ERROR)"
+STATUS_DELIVERY_DATE_MISSING = "DELIVERY Date Missing (ERROR)"
+STATUS_CUBE_WEIGHT_CASES_MISSING = "Cube, Weight or Cases Missing (ERROR)"
+STATUS_MISSING_TEMP = "Missing Temp. (ERROR)"
+STATUS_MISSING_MODE = "Missing Mode (ERROR)"
+STATUS_JSON_NOT_SENT = "JSON not sent (ERROR)"
+STATUS_RSC_NO_MATCH = "RSC # does NOT match (ERROR)"
+STATUS_DEST_NAME_NO_MATCH = "Destination name does NOT match (ERROR)"
+STATUS_PO_NOT_FOUND = "PO not FOUND (ERROR)"
+STATUS_UNREADABLE_FILE = "Unreadable File"
+STATUS_ALIAS_LOOKUP_FAILURE = "Alias Lookup failure (ERROR)"
+STATUS_CUSTOMER_MISSING = "Customer Missing"
+STATUS_ERROR_GENERIC = "ERROR (generic catch-all)"
+STATUS_PALLETS_MISSING_PEPSI = "Pallets Missing (Pepsi)"
+STATUS_LOAD_NUMBER_MISSING_PEPSI = "Load Number Missing (Pepsi)"
+STATUS_CLIENT_MISSING_PEPSI = "Client Missing (Pepsi)"
+STATUS_ORDER_MISSING_PEPSI = "Order # Missing (Pepsi)"
 
 
 def _payload_get(payload: Dict[str, Any], *keys: str, default: str = "") -> str:
@@ -619,6 +646,90 @@ def _payload_get(payload: Dict[str, Any], *keys: str, default: str = "") -> str:
         if d is None:
             return default
     return str(d) if d is not None else default
+
+
+def _compute_output_status(
+    item: Dict[str, Any],
+    payload: Dict[str, Any],
+    cell_fn: Any,
+    create_response: Dict[str, Any],
+) -> str:
+    """
+    Compute Status for output CSV: validation errors first, then Pepsi-specific, then API result.
+    """
+    errors = item.get("errors") or []
+    is_pepsi = item.get("payload_type") == "pepsi"
+
+    # Payload build errors (missing Pickup/Delivery location result)
+    if errors:
+        if any("Delivery" in e for e in errors):
+            return STATUS_DEST_MISSING
+        return STATUS_ALIAS_LOOKUP_FAILURE
+
+    # Required fields (input or payload)
+    if not (cell_fn("vendorno") or "").strip():
+        return STATUS_VENDOR_MISSING
+    dest = _payload_get(payload, "locations", "destination")
+    if not (dest or "").strip():
+        return STATUS_DEST_MISSING
+    pickup_date = _payload_get(payload, "dates", "pickup_date")
+    if not (pickup_date or "").strip():
+        return STATUS_PICKUP_DATE_MISSING
+    delivery_date = _payload_get(payload, "dates", "delivery_date")
+    if not (delivery_date or "").strip():
+        return STATUS_DELIVERY_DATE_MISSING
+
+    weight = (cell_fn("weight") or "").strip()
+    cube = (cell_fn("cubes") or "").strip()
+    cases = (cell_fn("cases") or "").strip()
+    if not weight and not cube and not cases:
+        return STATUS_CUBE_WEIGHT_CASES_MISSING
+    if not weight or not cube or not cases:
+        return STATUS_CUBE_WEIGHT_CASES_MISSING
+
+    service = payload.get("service") or {}
+    temperature = service.get("temperature", "")
+    # Pepsi always has temp from CSV; non-Pepsi we sometimes omit key when multiple commodities
+    if is_pepsi and not (temperature or "").strip():
+        return STATUS_MISSING_TEMP
+    if not is_pepsi and "temperature" in service and not (temperature or "").strip():
+        return STATUS_MISSING_TEMP
+    mode = _payload_get(payload, "service", "mode")
+    if not (mode or "").strip():
+        return STATUS_MISSING_MODE
+
+    customer = _payload_get(payload, "parties", "customer")
+    if not (customer or "").strip():
+        return STATUS_CUSTOMER_MISSING
+
+    # Pepsi-specific
+    if is_pepsi:
+        pallets = (cell_fn("pallets") or "").strip()
+        if not pallets:
+            return STATUS_PALLETS_MISSING_PEPSI
+        load_number = (cell_fn("invoiceRef") or "").strip()
+        if not load_number:
+            return STATUS_LOAD_NUMBER_MISSING_PEPSI
+        client = _payload_get(payload, "parties", "client")
+        if not (client or "").strip():
+            return STATUS_CLIENT_MISSING_PEPSI
+        order_po = (cell_fn("po") or "").strip()
+        if not order_po:
+            return STATUS_ORDER_MISSING_PEPSI
+
+    # API call result
+    if not create_response:
+        return STATUS_JSON_NOT_SENT
+    msg = (create_response.get("message") or "").upper()
+    if create_response.get("success"):
+        if "DUPLICATE" in msg or "ALREADY EXISTS" in msg:
+            return STATUS_PO_ALREADY_EXISTS
+        return STATUS_CREATED
+    if "DUPLICATE" in msg or "ALREADY EXISTS" in msg:
+        return STATUS_PO_ALREADY_EXISTS
+    if "RETRY" in msg:
+        return STATUS_RETRY
+    return STATUS_ERROR_GENERIC
 
 
 def write_output_csv(
@@ -657,6 +768,11 @@ def write_output_csv(
             service = payload.get("service") or {}
             temperature = service.get("temperature", "")
 
+            status = _compute_output_status(item, payload, cell, create_response)
+            is_pepsi = item.get("payload_type") == "pepsi"
+            load_number_pepsi = cell("invoiceRef") if is_pepsi else ""
+            order_pepsi = cell("po") if is_pepsi else ""
+
             writer.writerow({
                 "Item ID": cell("item_id"),
                 "JSON Request": json.dumps(payload, ensure_ascii=False),
@@ -678,8 +794,9 @@ def write_output_csv(
                 "Service": _payload_get(payload, "service", "service"),
                 "Temperature": temperature,
                 "API Call Result": api_result,
-                "Load Number (Pepsi)": "",  # user will specify later
-                "Order # (Pepsi)": "",  # user will specify later
+                "Status": status,
+                "Load Number (Pepsi)": load_number_pepsi,
+                "Order # (Pepsi)": order_pepsi,
             })
     logger.info("Wrote output CSV: %s (%d rows)", output_path, len(payloads))
 
