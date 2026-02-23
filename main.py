@@ -4,15 +4,17 @@ LA Location Search Toolkit.
 Gets a fresh Cognito token on each run, reads input CSV, calls location/search API per row,
 and returns id and company_id from each response.
 """
+import csv
 import json
 import sys
 import logging
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from datetime import date, timedelta
 
 import requests
 import pandas as pd
+from requests_aws4auth import AWS4Auth
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,6 +86,68 @@ def get_access_token(config: Dict[str, Any]) -> str:
     return access_token
 
 
+def create_shipment_via_api(payload: Dict[str, Any], shipment_config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    POST payload to shipment create API (AWS4Auth + x-api-key). Same logic as ShipmentUtility.create_shipment.
+    Returns {status_code, body, success, message} for the toolkit result.
+    """
+    url = (shipment_config.get("baseUrl") or "").strip()
+    region = shipment_config.get("region") or ""
+    service = shipment_config.get("service") or "execute-api"
+    api_key = shipment_config.get("apiKey") or ""
+    access_key = shipment_config.get("accessKey") or ""
+    secret_key = shipment_config.get("secretKey") or ""
+
+    if not all([url, region, service, api_key, access_key, secret_key]):
+        return {
+            "status_code": 0,
+            "body": "",
+            "success": False,
+            "message": "Shipment API config incomplete (baseUrl, region, service, apiKey, accessKey, secretKey)",
+        }
+
+    try:
+        auth = AWS4Auth(access_key, secret_key, region, service)
+        headers = {
+            "x-api-key": api_key,
+            "Content-Type": "application/json",
+        }
+        body_str = json.dumps(payload)
+        resp = requests.post(url, data=body_str, headers=headers, auth=auth, timeout=60)
+        body_text = resp.text
+
+        # Parse message for result (same idea as ShipmentUtility.parse_api_call_result)
+        message = "Error"
+        try:
+            if body_text.strip().startswith("{"):
+                root = json.loads(body_text)
+                if root.get("id") == "SHIP.PO.DUPLICATE" or "ALREADY EXISTS" in (root.get("message") or "").upper():
+                    message = "Duplicate PO - Shipment already exists"
+                elif "shipment_id" in root or "shipments" in root:
+                    message = "Shipment created successfully by BOT"
+            elif body_text.strip().startswith("["):
+                arr = json.loads(body_text)
+                if isinstance(arr, list) and len(arr) > 0:
+                    message = "Shipment created successfully by BOT"
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        return {
+            "status_code": resp.status_code,
+            "body": body_text,
+            "success": 200 <= resp.status_code < 300,
+            "message": message,
+        }
+    except Exception as e:
+        logger.exception("Shipment API request failed")
+        return {
+            "status_code": 0,
+            "body": str(e),
+            "success": False,
+            "message": str(e),
+        }
+
+
 def search_location(
     access_token: str,
     search_url: str,
@@ -112,22 +176,62 @@ def search_location(
 
 
 def extract_location_results(api_response: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """From location/search response, return list of {id, company_id, province} for each location."""
+    """From location/search response, return list of {id, company_id, province, commodities} for each location."""
     locations = api_response.get("locations") or []
     out = []
     for loc in locations:
         location_obj = loc.get("location") or {}
         province = location_obj.get("province")
+        commodities_raw = loc.get("commodities") or []
+        temperature_requirements = [
+            str(c.get("temperature_requirement", "")).strip()
+            for c in commodities_raw
+            if c.get("temperature_requirement")
+        ]
         out.append({
             "id": loc.get("id"),
             "company_id": loc.get("company_id"),
             "province": province,
+            "commodities": temperature_requirements,
         })
     return out
 
 
 def _norm(s: Any) -> str:
     return str(s or "").strip().casefold()
+
+
+# Hardcoded mode lookup: Origin province × Destination province → ROAD or RAIL (same table for Pepsi and non-Pepsi).
+# Eastern: NL, PEI, NS, NB, Quebec, Ontario. Western: Manitoba, Saskatchewan, Alberta, British Columbia.
+# Same block → ROAD; cross block → RAIL.
+_PROVINCES_EASTERN = (
+    "Newfoundland and Labrador",
+    "Prince Edward Island",
+    "Nova Scotia",
+    "New Brunswick",
+    "Quebec",
+    "Ontario",
+)
+_PROVINCES_WESTERN = (
+    "Manitoba",
+    "Saskatchewan",
+    "Alberta",
+    "British Columbia",
+)
+_MODE_LOOKUP: Dict[Tuple[str, str], str] = {}
+for _o in _PROVINCES_EASTERN + _PROVINCES_WESTERN:
+    for _d in _PROVINCES_EASTERN + _PROVINCES_WESTERN:
+        _same_block = (_o in _PROVINCES_EASTERN and _d in _PROVINCES_EASTERN) or (
+            _o in _PROVINCES_WESTERN and _d in _PROVINCES_WESTERN
+        )
+        _MODE_LOOKUP[(_norm(_o), _norm(_d))] = "ROAD" if _same_block else "RAIL"
+
+
+def get_mode_hardcoded(origin_province: Optional[str], destination_province: Optional[str]) -> str:
+    """Return ROAD or RAIL from hardcoded Origin×Destination table; empty string if unknown."""
+    if not origin_province or not destination_province:
+        return ""
+    return _MODE_LOOKUP.get((_norm(origin_province), _norm(destination_province)), "")
 
 
 def get_alias_source_from_row(row: Any, _cell_str: Any) -> str:
@@ -235,68 +339,59 @@ def adjust_to_previous_working_day(d: date, holidays: Set[date]) -> date:
     return d
 
 
-def _build_mode_maps(mat: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str], Dict[str, str]]:
-    """Strip index/columns and build normalized lookup maps. Drop unnamed/empty labels."""
-    mat = mat.copy()
-    mat.index = [str(x).strip() if pd.notna(x) else "" for x in mat.index]
-    mat.columns = [str(x).strip() if pd.notna(x) else "" for x in mat.columns]
-    # Drop rows/cols with empty or "Unnamed" labels
-    mat = mat[mat.index != ""]
-    mat = mat[[c for c in mat.columns if c != ""]]
-    if not mat.index.is_unique:
-        mat = mat[~mat.index.duplicated(keep="first")]
-    row_map = {_norm(x): x for x in mat.index if x}
-    col_map = {_norm(x): x for x in mat.columns if x}
-    return mat, row_map, col_map
-
-
-def load_mode_matrix(origins_destinations_xlsx_path: str) -> Tuple[pd.DataFrame, Dict[str, str], Dict[str, str]]:
-    """
-    Load 'Modes' sheet: row 2 = delivery provinces (columns), column B = pickup provinces (rows).
-    Pickup = row index, Delivery = column header. Lookup: mat.loc[pickup_province, delivery_province] -> ROAD/RAIL.
-    """
-    # Row 2 (0-based index 1) is the header row with delivery provinces; column B (index 1) has pickup provinces
-    raw = pd.read_excel(
-        origins_destinations_xlsx_path,
-        sheet_name="Modes",
-        engine="openpyxl",
-        header=1,
-    )
-    if raw.empty or len(raw.columns) < 2:
-        raise ValueError("Modes sheet is empty or not a matrix")
-    # Column B = index 1 = pickup/origin provinces (row labels)
-    origin_col = raw.columns[1]
-    mat = raw.set_index(origin_col)
-    mat, row_map, col_map = _build_mode_maps(mat)
-    if not row_map or not col_map:
-        raise ValueError("Modes sheet has no valid province labels in column B (rows) or row 2 (columns)")
-    return mat, row_map, col_map
-
-
-def get_mode_from_matrix(
-    pickup_province: Optional[str],
-    delivery_province: Optional[str],
-    mat: Optional[pd.DataFrame],
-    row_map: Optional[Dict[str, str]],
-    col_map: Optional[Dict[str, str]],
-) -> Optional[str]:
-    if not pickup_province or not delivery_province or mat is None or row_map is None or col_map is None:
-        return None
-    r_key = row_map.get(_norm(pickup_province))
-    c_key = col_map.get(_norm(delivery_province))
-    if not r_key or not c_key:
-        return None
-    try:
-        val = mat.at[r_key, c_key]
-    except (KeyError, TypeError):
-        return None
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return None
-    return str(val).strip()
-
-
 # Pepsi: CN Customer Reference # column for customer_shipment and pickup_appointment (user may override later)
 PEPSI_CN_REFERENCE_COLUMN = "pickApptNo"
+
+# Non-Pepsi: shipment_type column code (short form) → payload temperature (Temp Range)
+SHIPMENT_TYPE_TO_TEMPERATURE: Dict[str, str] = {
+    "FROZ": "FROZEN",
+    "GROC": "DRY",
+    "DAIR": "FRESH",
+    "MEAT": "FRESH",
+    "YGRT": "FRESH",
+    "REPK": "DRY",
+    "GRPK": "DRY",
+    "FSMT": "FRESH",
+}
+
+# monday_group_name values where shipment_type is NULL and temperature comes from pickup commodities
+NPOP_MONDAY_GROUPS_TEMP_FROM_PICKUP = (
+    "NPOP (LA3)/{SOBEYSMIF}.pdf",
+    "NPOP (LA6)/{MIFLAOPS}.pdf",
+)
+
+
+def _shipment_type_code_to_temperature(code: str) -> str:
+    """Map shipment_type column code (e.g. FROZ, (FROZ)) to Temp Range (FROZEN, DRY, FRESH)."""
+    if not code:
+        return ""
+    raw = str(code).strip().upper().replace("(", "").replace(")", "")
+    return SHIPMENT_TYPE_TO_TEMPERATURE.get(raw, "")
+
+
+def _resolve_non_pepsi_temperature(
+    shipment_type_val: str,
+    monday_group_val: str,
+    pickup_result: Optional[Dict[str, Any]],
+) -> str:
+    """
+    Non-Pepsi temperature: from shipment_type column (code → Temp Range), or for NPOP LA3/LA6
+    when shipment_type is NULL, from pickup location's commodities (one requirement → use it; multiple → empty).
+    """
+    monday_normalized = (monday_group_val or "").strip().lower()
+    shipment_empty = not (shipment_type_val or "").strip()
+    npop_match = any(monday_normalized == mg.strip().lower() for mg in NPOP_MONDAY_GROUPS_TEMP_FROM_PICKUP)
+
+    if shipment_empty and npop_match and pickup_result:
+        commodities = pickup_result.get("commodities") or []
+        unique_temps = list(dict.fromkeys([t for t in commodities if t]))
+        if len(unique_temps) == 1:
+            return unique_temps[0]
+        return ""
+
+    if shipment_type_val:
+        return _shipment_type_code_to_temperature(shipment_type_val)
+    return ""
 
 
 def build_shipment_payload(
@@ -305,17 +400,11 @@ def build_shipment_payload(
     delivery_result: Optional[Dict[str, Any]],
     _cell_str: Any,
     holidays: Optional[Set[date]],
-    mode_matrix: Optional[pd.DataFrame],
-    mode_row_map: Optional[Dict[str, str]],
-    mode_col_map: Optional[Dict[str, str]],
     is_pepsi: bool = False,
-    pepsi_mode_matrix: Optional[pd.DataFrame] = None,
-    pepsi_mode_row_map: Optional[Dict[str, str]] = None,
-    pepsi_mode_col_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
-    Build shipment payload. If is_pepsi (template_flag=Pepsi): Pepsi payload shape and Pepsi mode sheet.
-    Else: current (non-Pepsi) payload shape and origins_destinations mode sheet.
+    Build shipment payload. If is_pepsi (template_flag=Pepsi): Pepsi payload shape.
+    Else: non-Pepsi payload shape. service.mode uses hardcoded Origin×Destination table for both.
     """
     def _get_cell(col: str, default: Any = None) -> Any:
         val = _cell_str(row.get(col))
@@ -353,23 +442,11 @@ def build_shipment_payload(
     delivery_date_parsed = parse_any_date(delivery_date_raw)
     delivery_date_out = delivery_date_parsed.strftime("%Y-%m-%d") if delivery_date_parsed else delivery_date_raw
 
-    # Mode: Pepsi uses pepsi sheet, non-Pepsi uses origins_destinations sheet
-    if is_pepsi and pepsi_mode_matrix is not None and pepsi_mode_row_map is not None and pepsi_mode_col_map is not None:
-        mode_val = get_mode_from_matrix(
-            pickup_result.get("province") if pickup_result else None,
-            delivery_result.get("province") if delivery_result else None,
-            pepsi_mode_matrix,
-            pepsi_mode_row_map,
-            pepsi_mode_col_map,
-        ) or ""
-    else:
-        mode_val = get_mode_from_matrix(
-            pickup_result.get("province") if pickup_result else None,
-            delivery_result.get("province") if delivery_result else None,
-            mode_matrix,
-            mode_row_map,
-            mode_col_map,
-        ) or ""
+    # Mode: hardcoded Origin×Destination table (same for Pepsi and non-Pepsi)
+    mode_val = get_mode_hardcoded(
+        pickup_result.get("province") if pickup_result else None,
+        delivery_result.get("province") if delivery_result else None,
+    )
 
     quantities_block = {
         "weight": _get_float("weight", 0.0),
@@ -381,8 +458,18 @@ def build_shipment_payload(
         "pallets": _get_int("pallets", 0),
     }
 
+    # Temperature: Pepsi = CSV "temp" column; Non-Pepsi = shipment_type code map or pickup commodities (NPOP exception)
     if is_pepsi:
-        # Pepsi payload structure
+        temperature_val = _get_cell("temp", "")
+    else:
+        temperature_val = _resolve_non_pepsi_temperature(
+            _get_cell("shipment_type", ""),
+            _get_cell("monday_group_name", ""),
+            pickup_result,
+        )
+
+    if is_pepsi:
+        # Pepsi payload structure (customer_shipment and pickup_appointment from pickApptNo)
         cn_ref = _get_cell(PEPSI_CN_REFERENCE_COLUMN, "")
         payload = {
             "description": "Shipment Creation by BOT (PEPSI)",
@@ -409,11 +496,17 @@ def build_shipment_payload(
             "service": {
                 "mode": mode_val,
                 "service": "LTL",
-                "temperature": "DRY",  # TODO: calculate based on logic to be provided
+                "temperature": temperature_val,
             },
         }
     else:
         # Non-Pepsi (current) payload structure
+        service_block: Dict[str, Any] = {
+            "mode": mode_val,
+            "service": "LTL",
+        }
+        if temperature_val:
+            service_block["temperature"] = temperature_val
         payload = {
             "description": "Shipment Creation by BOT",
             "purchase_order": _get_cell("po", ""),
@@ -433,11 +526,7 @@ def build_shipment_payload(
                 "customer": str(delivery_result["id"]) if delivery_result and delivery_result.get("id") else "",
                 "client": str(delivery_result["company_id"]) if delivery_result and delivery_result.get("company_id") else "",
             },
-            "service": {
-                "mode": mode_val,
-                "service": "LTL",
-                "temperature": "FROZEN",  # TODO: calculate based on logic to be provided
-            },
+            "service": service_block,
         }
     return payload
 
@@ -447,16 +536,10 @@ def build_shipment_payloads(
     location_results: List[Dict[str, Any]],
     _cell_str: Any,
     holidays: Optional[Set[date]],
-    mode_matrix: Optional[pd.DataFrame],
-    mode_row_map: Optional[Dict[str, str]],
-    mode_col_map: Optional[Dict[str, str]],
-    pepsi_mode_matrix: Optional[pd.DataFrame] = None,
-    pepsi_mode_row_map: Optional[Dict[str, str]] = None,
-    pepsi_mode_col_map: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Group location results by row_index, match with CSV rows, build one payload per row.
-    If template_flag = Pepsi: Pepsi payload + Pepsi mode sheet. Else: non-Pepsi payload + origins_destinations mode.
+    Mode is from hardcoded Origin×Destination table (same for Pepsi and non-Pepsi).
     """
     by_row: Dict[int, Dict[str, Optional[Dict[str, Any]]]] = {}
     for res in location_results:
@@ -489,13 +572,7 @@ def build_shipment_payloads(
             delivery_res,
             _cell_str,
             holidays,
-            mode_matrix,
-            mode_row_map,
-            mode_col_map,
             is_pepsi=is_pepsi,
-            pepsi_mode_matrix=pepsi_mode_matrix,
-            pepsi_mode_row_map=pepsi_mode_row_map,
-            pepsi_mode_col_map=pepsi_mode_col_map,
         )
         payloads.append({
             "row_index": row_index,
@@ -507,14 +584,113 @@ def build_shipment_payloads(
     return payloads
 
 
+# Output CSV column names (order matches output_sheet.csv)
+OUTPUT_CSV_COLUMNS = [
+    "Item ID",
+    "JSON Request",
+    "JSON Response",
+    "Description",
+    "Purchase Order",
+    "Vendor #",
+    "Pick Up Date",
+    "Delivery Date",
+    "Weight",
+    "Cube",
+    "Lifts",
+    "Pallets",
+    "Origin / Load At",
+    "Destination / Delivery Location",
+    "Customer / PickUp Company",
+    "Client / Consignee",
+    "Mode",
+    "Service",
+    "Temperature",
+    "API Call Result",
+    "Load Number (Pepsi)",
+    "Order # (Pepsi)",
+]
+
+
+def _payload_get(payload: Dict[str, Any], *keys: str, default: str = "") -> str:
+    """Get nested value from payload, e.g. _payload_get(p, 'dates', 'pickup_date')."""
+    d = payload
+    for k in keys:
+        d = (d or {}).get(k)
+        if d is None:
+            return default
+    return str(d) if d is not None else default
+
+
+def write_output_csv(
+    output_path: str,
+    df: pd.DataFrame,
+    payloads: List[Dict[str, Any]],
+    _cell_str: Any,
+) -> None:
+    """
+    Write one row per payload to output CSV. Column mapping from payload + input row + create_response.
+    """
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_CSV_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for item in payloads:
+            row_index = item.get("row_index", 1)
+            payload = item.get("payload") or {}
+            create_response = item.get("create_response") or {}
+            # Input row: 1-based row_index -> 0-based iloc
+            try:
+                input_row = df.iloc[row_index - 1]
+            except (IndexError, KeyError):
+                input_row = {}
+            def cell(col: str) -> str:
+                v = input_row.get(col) if hasattr(input_row, "get") else ""
+                return _cell_str(v) or ""
+
+            json_response = create_response.get("body", "")
+            api_result = create_response.get("message", "")
+            if item.get("errors"):
+                if not api_result:
+                    api_result = "Skipped (payload has errors)"
+            if not api_result and not item.get("errors"):
+                api_result = "Not sent (shipment_api not configured)"
+
+            service = payload.get("service") or {}
+            temperature = service.get("temperature", "")
+
+            writer.writerow({
+                "Item ID": cell("item_id"),
+                "JSON Request": json.dumps(payload, ensure_ascii=False),
+                "JSON Response": json_response,
+                "Description": cell("description"),
+                "Purchase Order": cell("po"),
+                "Vendor #": cell("vendorno"),
+                "Pick Up Date": _payload_get(payload, "dates", "pickup_date"),
+                "Delivery Date": _payload_get(payload, "dates", "delivery_date"),
+                "Weight": cell("weight"),
+                "Cube": cell("cubes"),
+                "Lifts": cell("lifts"),
+                "Pallets": cell("pallets"),
+                "Origin / Load At": _payload_get(payload, "locations", "origin"),
+                "Destination / Delivery Location": _payload_get(payload, "locations", "destination"),
+                "Customer / PickUp Company": _payload_get(payload, "parties", "customer"),
+                "Client / Consignee": _payload_get(payload, "parties", "client"),
+                "Mode": _payload_get(payload, "service", "mode"),
+                "Service": _payload_get(payload, "service", "service"),
+                "Temperature": temperature,
+                "API Call Result": api_result,
+                "Load Number (Pepsi)": "",  # user will specify later
+                "Order # (Pepsi)": "",  # user will specify later
+            })
+    logger.info("Wrote output CSV: %s (%d rows)", output_path, len(payloads))
+
+
 def location_search(
     csv_path: str,
     config_path: Optional[str] = None,
     location_type: str = LOCATION_TYPE_BOTH,
     include_commodities: bool = True,
     transit_time_xlsx_path: Optional[str] = None,
-    origins_destinations_xlsx_path: Optional[str] = None,
-    pepsi_sheet_path: Optional[str] = None,
+    output_csv_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Read CSV, call location/search API per row. By default runs both Pickup and Delivery.
@@ -701,9 +877,6 @@ def location_search(
     # Build shipment payloads when running both Pickup and Delivery
     if run_both:
         holidays: Optional[Set[date]] = None
-        mode_matrix: Optional[pd.DataFrame] = None
-        mode_row_map: Optional[Dict[str, str]] = None
-        mode_col_map: Optional[Dict[str, str]] = None
 
         payload_errors: List[str] = []
         if transit_time_xlsx_path:
@@ -714,32 +887,36 @@ def location_search(
         else:
             payload_errors.append("Missing transit_time_xlsx_path (needed to adjust pickup_date for holidays/weekends)")
 
-        if origins_destinations_xlsx_path:
-            try:
-                mode_matrix, mode_row_map, mode_col_map = load_mode_matrix(origins_destinations_xlsx_path)
-            except Exception as e:
-                payload_errors.append(f"Failed to load mode matrix: {e}")
-        else:
-            payload_errors.append("Missing origins_destinations_xlsx_path (needed to compute service.mode)")
-
-        pepsi_mode_matrix: Optional[pd.DataFrame] = None
-        pepsi_mode_row_map: Optional[Dict[str, str]] = None
-        pepsi_mode_col_map: Optional[Dict[str, str]] = None
-        if pepsi_sheet_path:
-            try:
-                pepsi_mode_matrix, pepsi_mode_row_map, pepsi_mode_col_map = load_mode_matrix(pepsi_sheet_path)
-            except Exception as e:
-                payload_errors.append(f"Failed to load Pepsi mode matrix: {e}")
-
         if payload_errors:
             result_data["payload_setup_errors"] = payload_errors
 
-        payloads = build_shipment_payloads(
-            df, results, _cell_str, holidays,
-            mode_matrix, mode_row_map, mode_col_map,
-            pepsi_mode_matrix, pepsi_mode_row_map, pepsi_mode_col_map,
-        )
+        payloads = build_shipment_payloads(df, results, _cell_str, holidays)
+
+        # Optional: call shipment create API for each payload if config has shipment_api
+        shipment_config = config.get("shipment_api")
+        if shipment_config and isinstance(shipment_config, dict):
+            for item in payloads:
+                if item.get("errors"):
+                    item["create_response"] = {
+                        "status_code": 0,
+                        "body": "",
+                        "success": False,
+                        "message": "Skipped (payload has errors)",
+                    }
+                else:
+                    item["create_response"] = create_shipment_via_api(
+                        item.get("payload") or {}, shipment_config
+                    )
+
         result_data["payloads"] = payloads
+
+        if output_csv_path:
+            try:
+                write_output_csv(output_csv_path, df, payloads, _cell_str)
+                result_data["output_csv_path"] = output_csv_path
+            except Exception as e:
+                logger.exception("Failed to write output CSV")
+                result_data["output_csv_error"] = str(e)
 
     return {
         "result": result_data,
@@ -768,8 +945,7 @@ def main() -> None:
             location_type=args.get("location_type") or args.get("type", LOCATION_TYPE_BOTH),
             include_commodities=args.get("include_commodities", DEFAULT_INCLUDE_COMMODITIES),
             transit_time_xlsx_path=args.get("transit_time_xlsx_path"),
-            origins_destinations_xlsx_path=args.get("origins_destinations_xlsx_path"),
-            pepsi_sheet_path=args.get("pepsi_sheet_path"),
+            output_csv_path=args.get("output_csv_path"),
         )
         print(json.dumps(result, indent=2))
     else:
