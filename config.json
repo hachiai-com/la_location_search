@@ -1,0 +1,16 @@
+{
+  "cognito": {
+    "cognito_domain": "https://la-dev.auth.ca-central-1.amazoncognito.com",
+    "client_id": "7bf0f2b5mh5ef34ll0l7mmince",
+    "client_secret": "kma80n7akmhrn4rjja0d62n4l94jieoj8ktl84agn8ufg2s2ie8",
+    "scopes": "default-m2m-resource-server-dro1eg/read"
+  },
+  "location_api": {
+    "search_url": "https://siwy6vb99l.execute-api.ca-central-1.amazonaws.com/qa/location-module/location/search"
+  },
+  "csv_columns": {
+    "alias_source": "vendorname",
+    "alias_value": "vendorno",
+    "street_address": "shipfrom_street"
+  }
+}

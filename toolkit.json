@@ -1,0 +1,57 @@
+{
+  "slug": "la-location-search",
+  "display_name": "LA Location Search",
+  "description": "Reads a CSV, gets a fresh Cognito token, calls location/search API per row. Default: runs both Pickup and Delivery in one execution; returns id, company_id, province (and location_type) for each location.",
+  "version": "0.2.0",
+  "entrypoint": {
+    "type": "python",
+    "command": "python main.py"
+  },
+  "capabilities": [
+    {
+      "name": "location_search",
+      "description": "Process CSV: OAuth2 token, then location/search API per row. Default (both): CSV must have all four columns; runs both Pickup and Delivery per row; returns id, company_id, province, location_type. Set location_type to Pickup or Delivery to run only one.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "csv_path": {
+            "type": "string",
+            "description": "Absolute path to the input CSV."
+          },
+          "config_path": {
+            "type": "string",
+            "description": "Optional path to config.json."
+          },
+          "location_type": {
+            "type": "string",
+            "enum": ["both", "Pickup", "Delivery"],
+            "description": "Default both: run Pickup and Delivery. Pickup or Delivery: run only that type."
+          },
+          "type": {
+            "type": "string",
+            "description": "Alias for location_type (Pickup or Delivery)."
+          },
+          "include_commodities": {
+            "type": "boolean",
+            "description": "For Pickup only. Default true."
+          },
+          "transit_time_xlsx_path": {
+            "type": "string",
+            "description": "Absolute path to 'Transit Time - BOT (PROD).xlsx' (used to adjust pickup_date from Holidays sheet). Required for payload date adjustment."
+          },
+          "origins_destinations_xlsx_path": {
+            "type": "string",
+            "description": "Absolute path to 'Origins & Destinations - BOT (PROD).xlsx' (used to compute service.mode from Modes sheet). Required for payload mode mapping."
+          },
+          "pepsi_sheet_path": {
+            "type": "string",
+            "description": "Optional. Absolute path to 'Pepsi Altruos (PROD).xlsx' (Modes sheet). Used for service.mode when template_flag is Pepsi."
+          }
+        },
+        "required": ["csv_path"]
+      }
+    }
+  ],
+  "author": "neehar",
+  "tags": ["location", "search", "csv", "cognito", "logistics", "pickup", "delivery"]
+}
