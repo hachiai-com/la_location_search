@@ -20,7 +20,7 @@
           },
           "config_path": {
             "type": "string",
-            "description": "Optional path to config.json."
+            "description": "Path to your config file (required). Config contains secrets; do not commit config.json to the repo. Use a path outside the repo or see config.example.json for structure."
           },
           "location_type": {
             "type": "string",
@@ -44,7 +44,7 @@
             "description": "Optional. When running both: write one row per payload to this CSV (Item ID, JSON Request, JSON Response, Description, PO, Vendor #, dates, quantities, origin/destination, parties, service, API Call Result, etc.)."
           }
         },
-        "required": ["csv_path"]
+        "required": ["csv_path", "config_path"]
       }
     }
   ],
