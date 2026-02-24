@@ -6,19 +6,29 @@ Reads an input CSV, obtains a fresh Cognito OAuth2 token on each run, calls the 
 
 ```
 la_location_search/
-├── config.json      # Credentials and API URLs (Cognito + location/search)
-├── main.py          # Toolkit entrypoint (stdin JSON → stdout JSON)
-├── requirements.txt # Python dependencies
-├── toolkit.json     # Toolkit metadata and capabilities
-└── README.md        # This file
+├── config.example.json  # Example config structure (no secrets); copy and fill your values
+├── main.py              # Toolkit entrypoint (stdin JSON → stdout JSON)
+├── requirements.txt     # Python dependencies
+├── toolkit.json         # Toolkit metadata and capabilities
+└── README.md            # This file
 ```
 
-## Configuration (config.json)
+**Do not commit `config.json`** — it contains secrets. Use `config_path` to point to your config file (e.g. outside the repo). `.gitignore` excludes `config.json`.
+
+## Configuration (config_path required)
+
+**`config_path` is a required argument.** Pass the path to your config file on every run. The config file contains secrets (Cognito, API keys) and must not be committed to the repo.
 
 - **cognito**: `token_url` (or `cognito_domain`), `client_id`, `client_secret`, `scope` for OAuth2 client_credentials.
 - **location_api**: `search_url` for the location/search API.
-- **shipment_api** (optional): When present, each built payload is POSTed to the shipment create API. Use `region`, `service`, `baseUrl`, `apiKey`, `accessKey`, `secretKey` (AWS4Auth + x-api-key). Same contract as ShipmentUtility: POST JSON to `baseUrl`.
-- **csv_columns** (optional): Override CSV column names (see mapping below).
+- **shipment_api** (optional): When present, each built payload is POSTed to the shipment create API. Use `region`, `service`, `baseUrl`, `apiKey`, `accessKey`, `secretKey` (AWS4Auth + x-api-key).
+- **csv_columns** (optional): Override the CSV column names the toolkit expects. Use this when your CSV uses different headers than the defaults:
+  - **alias_value**: column for vendor number (default `vendorno`). Used for Pickup.
+  - **street_address**: column for pickup street address (default `shipfrom_street`).
+  - **ship_to_street_address**: column for delivery street address (default `shipto_street`).
+  - `alias_source` is **not** a column — it is derived in code from `template_flag`, `vendorno`, `description`, `monday_group_name`, `consignee`.
+
+See `config.example.json` for the full structure (no real secrets).
 
 The token is requested **on every run** because it expires in 1 hour.
 
@@ -64,30 +74,30 @@ When `location_type` is omitted or set to `"both"`, **one execution runs both Pi
    ```
 
 2. **Configure**  
-   Edit `config.json` with your Cognito and location API settings.
+   Copy `config.example.json` to a config file (e.g. outside the repo), fill in your Cognito and API settings, and pass its path as `config_path`. Do not commit that file.
 
 3. **Run both Pickup and Delivery (default)**
 
-   CSV must have: `vendorno`, `shipfrom_street`, `shipto_street`, `template_flag`, `description`, `monday_group_name`, `consignee`.
+   CSV must have: `vendorno`, `shipfrom_street`, `shipto_street`, `template_flag`, `description`, `monday_group_name`, `consignee`. **Required:** `csv_path`, `config_path`.
 
    ```powershell
-   echo '{"capability":"location_search","args":{"csv_path":"C:\\Users\\neeha\\Downloads\\test_data.csv","transit_time_xlsx_path":"C:\\path\\to\\Transit Time - BOT (PROD).xlsx"}}' | python main.py
+   echo '{"capability":"location_search","args":{"csv_path":"C:\\Users\\neeha\\Downloads\\test_data.csv","config_path":"C:\\path\\to\\your\\config.json","transit_time_xlsx_path":"C:\\path\\to\\Transit Time - BOT (PROD).xlsx"}}' | python main.py
    ```
 
    To write an **output CSV** with one row per payload (request/response, description, PO, vendor, dates, weight, cube, origin/destination, customer/client, mode, service, temperature, API call result):
 
    ```powershell
-   echo '{"capability":"location_search","args":{"csv_path":"C:\\...\\test_data.csv","transit_time_xlsx_path":"C:\\...\\Transit Time - BOT (PROD).xlsx","output_csv_path":"C:\\...\\output_sheet.csv"}}' | python main.py
+   echo '{"capability":"location_search","args":{"csv_path":"C:\\...\\test_data.csv","config_path":"C:\\...\\your_config.json","transit_time_xlsx_path":"C:\\...\\Transit Time - BOT (PROD).xlsx","output_csv_path":"C:\\...\\output_sheet.csv"}}' | python main.py
    ```
 
 4. **Run only Pickup or only Delivery**
 
    ```powershell
-   echo '{"capability": "location_search", "args": {"csv_path": "C:\\Users\\neeha\\Downloads\\test_data.csv", "location_type": "Pickup"}}' | python main.py
-   echo '{"capability": "location_search", "args": {"csv_path": "C:\\Users\\neeha\\Downloads\\test_data.csv", "location_type": "Delivery"}}' | python main.py
+   echo '{"capability":"location_search","args":{"csv_path":"C:\\Users\\neeha\\Downloads\\test_data.csv","config_path":"C:\\path\\to\\your\\config.json","location_type":"Pickup"}}' | python main.py
+   echo '{"capability":"location_search","args":{"csv_path":"C:\\Users\\neeha\\Downloads\\test_data.csv","config_path":"C:\\path\\to\\your\\config.json","location_type":"Delivery"}}' | python main.py
    ```
 
-   Optional args: `config_path`, `include_commodities` (Pickup only, default `true`).
+   Optional args: `include_commodities` (Pickup only, default `true`).
 
 **Note:** You must pipe the JSON into `python main.py` (the `| python main.py` part). Replace the CSV path with your file path.
 
@@ -203,6 +213,6 @@ When `output_csv_path` is provided, one row per payload is written with these co
 | Service | Payload `service.service` |
 | Temperature | Payload `service.temperature` |
 | API Call Result | Shipment API result message (success, error, skipped, or "Not sent" if API not configured) |
-| Status | One of: In Queue, Created, PO already exists in Altruos, Retry; or error statuses (Vendor # Missing, Dest. Missing, PICKUP/DELIVERY Date Missing, Cube/Weight/Cases Missing, Missing Temp, Missing Mode, JSON not sent, Customer Missing, ERROR); or Pepsi-specific (Pallets/Load Number/Client/Order # Missing (Pepsi)). Populated from validation and API result. |
+| Status | One of: In Queue, Created, PO already exists in Altruos, Retry; or error statuses (Vendor # Missing, Dest. Missing, PICKUP/DELIVERY Date Missing, Cube/Weight/Cases Missing, Missing Temp, Missing Mode, JSON not sent, Customer Missing, Cannot read address (ERROR), ERROR); or Pepsi-specific (Pallets/Load Number/Client/Order # Missing (Pepsi)). **Cannot read address (ERROR)** is set when the location/search API returns `{"locations": []}` for the given street_address (Pickup or Delivery). |
 | Load Number (Pepsi) | Input CSV `invoiceRef` (Pepsi rows only; empty for non-Pepsi) |
 | Order # (Pepsi) | Input CSV `po` (Pepsi rows only; empty for non-Pepsi) |
