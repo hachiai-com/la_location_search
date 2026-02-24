@@ -574,11 +574,16 @@ def build_shipment_payloads(
             holidays,
             is_pepsi=is_pepsi,
         )
+        cannot_read_address = any(
+            r.get("row_index") == row_index and r.get("error") == ERROR_EMPTY_LOCATIONS_ADDRESS
+            for r in location_results
+        )
         payloads.append({
             "row_index": row_index,
             "payload": payload,
             "payload_type": "pepsi" if is_pepsi else "non_pepsi",
             "errors": errors if errors else None,
+            "cannot_read_address": cannot_read_address,
         })
 
     return payloads
@@ -636,6 +641,10 @@ STATUS_PALLETS_MISSING_PEPSI = "Pallets Missing (Pepsi)"
 STATUS_LOAD_NUMBER_MISSING_PEPSI = "Load Number Missing (Pepsi)"
 STATUS_CLIENT_MISSING_PEPSI = "Client Missing (Pepsi)"
 STATUS_ORDER_MISSING_PEPSI = "Order # Missing (Pepsi)"
+STATUS_CANNOT_READ_ADDRESS = "Cannot read address (ERROR)"
+
+# Error message stored in location result when API returns {"locations": []}
+ERROR_EMPTY_LOCATIONS_ADDRESS = "Cannot read address"
 
 
 def _payload_get(payload: Dict[str, Any], *keys: str, default: str = "") -> str:
@@ -659,6 +668,10 @@ def _compute_output_status(
     """
     errors = item.get("errors") or []
     is_pepsi = item.get("payload_type") == "pepsi"
+
+    # Street address unreadable: API returned {"locations": []} for Pickup or Delivery
+    if item.get("cannot_read_address"):
+        return STATUS_CANNOT_READ_ADDRESS
 
     # Payload build errors (missing Pickup/Delivery location result)
     if errors:
@@ -976,7 +989,8 @@ def location_search(
                 )
                 location_results = extract_location_results(response)
                 if not location_results:
-                    results.append(_empty_result(row_index, "No locations in response", run_type))
+                    err_msg = ERROR_EMPTY_LOCATIONS_ADDRESS if response.get("locations") == [] else "No locations in response"
+                    results.append(_empty_result(row_index, err_msg, run_type))
                 else:
                     for loc in location_results:
                         results.append(_success_result(row_index, loc, run_type))
