@@ -41,11 +41,12 @@ LOCATION_TYPE_BOTH = "both"  # Run both Pickup and Delivery in one execution
 
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
-    """Load config from path or default location next to main.py."""
-    if config_path and Path(config_path).exists():
-        path = Path(config_path)
-    else:
-        path = Path(__file__).resolve().parent / "config.json"
+    """Load config from the given path. config_path is required (config contains secrets and should not be in repo)."""
+    if not (config_path and str(config_path).strip()):
+        raise FileNotFoundError(
+            "config_path is required. Pass the path to your config file (do not commit config.json; it contains secrets)."
+        )
+    path = Path(config_path)
     if not path.exists():
         raise FileNotFoundError(f"Config not found: {path}")
     with open(path, "r", encoding="utf-8") as f:
