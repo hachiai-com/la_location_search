@@ -41,12 +41,12 @@ The token is requested **on every run** because it expires in 1 hour.
 - **alias_value** = `vendorno`.
 - **alias_source logic**:
   - **PEPSI TENDER** (template_flag = "Pepsi"): vendorno 204047 → "PEPSI TENDER - FOOD vendor"; 21200Y → "PEPSI TENDER - BEVERAGE"; 21200E → "PEPSI TENDER - QUAKER".
-  - **SOBEYS TENDER** (template_flag = "template-1" or Null): description has "M&M" → "SOBEYS TENDER - M&M"; monday_group_name has "NPOP (LA6)" and "MIFLAOPS" → "SOBEYS TENDER - LA6"; else consignee has RSC8/RSC9/RSC12/CFC3 (and no M&M, no NPOP in monday_group_name) → "SOBEYS TENDER - OTR"; else → "SOBEYS TENDER - ADMIN".
+  - **SOBEYS TENDER** (template_flag = "template-1" or Null): (1) If **monday_group_name** exactly equals the single string `NPOP (LA6)_{MIFLAOPS}.pdf` → "SOBEYS TENDER - LA6". (2) Else if **description** contains "M&M" (exact substring) → "SOBEYS TENDER - M&M". (3) Else if description does not have "M&M" and monday_group_name ≠ that exact string and **consignee** has RSC8/RSC9/RSC12/CFC3 → "SOBEYS TENDER - OTR". (4) Else if description has neither "M&M" nor "OTR" → "SOBEYS TENDER - ADMIN".
 - **Returned from response**: `id`, `company_id`, `province` (from `location.province`).
 
 ### Case 2: Delivery
 
-- **Parameters sent to API**: `street_address`, `type: "Delivery"`.
+- **Parameters sent to API**: `street_address`, `type: "Delivery"`. The **street_address** value is strictly the **shipto_street** column from the input CSV.
 - **Required CSV column** (strict):
 
 | Parameter       | CSV column name             |
@@ -59,10 +59,10 @@ If any required column is missing from the CSV or empty for a row, the toolkit r
 
 ### Default: run both (Pickup and Delivery)
 
-When `location_type` is omitted or set to `"both"`, **one execution runs both Pickup and Delivery**. The CSV must have: `vendorno`, `ship_from_street_address`, `ship_to_street_address`, `template_flag`, `description`, `monday_group_name`, `consignee`. For each row:
+When `location_type` is omitted or set to `"both"`, **one execution runs both Pickup and Delivery**. The CSV must have: `vendorno`, `shipfrom_street`, `shipto_street`, `template_flag`, `description`, `monday_group_name`, `consignee`. For each row:
 
-- **alias_source** is derived from template_flag, vendorno, description, monday_group_name, consignee (see Pickup logic above). If the row has a non-empty alias_source, vendorno, and ship_from_street_address, the Pickup API is called and results are tagged `"location_type": "Pickup"`.
-- If the row has ship_to_street_address, the Delivery API is called and results are tagged `"location_type": "Delivery"`.
+- **alias_source** is derived from template_flag, vendorno, description, monday_group_name, consignee (see Pickup logic above). If the row has a non-empty alias_source, vendorno, and shipfrom_street, the Pickup API is called and results are tagged `"location_type": "Pickup"`.
+- If the row has shipto_street, the Delivery API is called with that value as street_address and results are tagged `"location_type": "Delivery"`.
 - A row can have both, one, or neither (rows with neither get a single error entry).
 
 ## Usage

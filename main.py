@@ -10,7 +10,7 @@ import sys
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import requests
 import pandas as pd
@@ -165,12 +165,12 @@ def search_location(
     }
     payload: Dict[str, Any] = {
         "street_address": street_address.strip(),
+        "include_commodities": include_commodities,
         "type": search_type,
     }
     if search_type == LOCATION_TYPE_PICKUP and alias_source is not None and alias_value is not None:
         payload["alias_source"] = alias_source
         payload["alias_value"] = str(alias_value)
-        payload["include_commodities"] = include_commodities
     resp = requests.post(search_url, headers=headers, json=payload, timeout=30)
     resp.raise_for_status()
     return resp.json()
@@ -200,6 +200,14 @@ def extract_location_results(api_response: Dict[str, Any]) -> List[Dict[str, Any
 
 def _norm(s: Any) -> str:
     return str(s or "").strip().casefold()
+
+
+def _is_street_null_or_blank(val: Any) -> bool:
+    """True if street value is NULL (literal) or empty/missing; used for Cannot read address (ERROR)."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return True
+    s = str(val).strip()
+    return not s or s.upper() == "NULL"
 
 
 # Hardcoded mode lookup: Origin province × Destination province → ROAD or RAIL (same table for Pepsi and non-Pepsi).
@@ -235,11 +243,23 @@ def get_mode_hardcoded(origin_province: Optional[str], destination_province: Opt
     return _MODE_LOOKUP.get((_norm(origin_province), _norm(destination_province)), "")
 
 
+# Single exact string for SOBEYS TENDER - LA6 (alias_source; monday_group_name must match this exactly)
+MONDAY_GROUP_LA6_EXACT = "NPOP (LA6)_{MIFLAOPS}.pdf"
+
 def get_alias_source_from_row(row: Any, _cell_str: Any) -> str:
     """
-    Derive alias_source from CSV row. Used for both Pickup and Delivery.
-    PEPSI TENDER: template_flag = "Pepsi" → vendorno 204047/21200Y/21200E → FOOD vendor / BEVERAGE / QUAKER.
-    SOBEYS TENDER: template_flag = "template-1" or Null → description/monday_group_name/consignee → M&M / LA6 / OTR / ADMIN.
+    Derive alias_source from CSV row for Pickup only.
+
+    PEPSI TENDER (template_flag = "Pepsi"):
+      - vendorno "204047" → "PEPSI TENDER - FOOD"
+      - vendorno "21200Y" → "PEPSI TENDER - BEVERAGE"
+      - vendorno "21200E" → "PEPSI TENDER - QUAKER"
+
+    SOBEYS TENDER (template_flag = "template-1" or Null):
+      1. If monday_group_name exactly equals "NPOP (LA6)_{MIFLAOPS}.pdf" (single string) → "SOBEYS TENDER - LA6"
+      2. Else if description contains "M&M" (exact substring) → "SOBEYS TENDER - M&M"
+      3. Else if description does not have "M&M" and monday_group_name ≠ that exact string and consignee has RSC8/RSC9/RSC12/CFC3 → "SOBEYS TENDER - OTR"
+      4. Else if description has neither "M&M" nor "OTR" → "SOBEYS TENDER - ADMIN"
     """
     template = _cell_str(row.get("template_flag"))
     vendorno = _cell_str(row.get("vendorno"))
@@ -247,31 +267,105 @@ def get_alias_source_from_row(row: Any, _cell_str: Any) -> str:
     monday_group = _cell_str(row.get("monday_group_name"))
     consignee = _cell_str(row.get("consignee"))
 
-    # PEPSI TENDER
+    # PEPSI TENDER: template_flag = "Pepsi" → vendorno determines alias_source
     if _norm(template) == "pepsi":
         if vendorno == "204047":
-            return "PEPSI TENDER - FOOD vendor"
+            return "PEPSI TENDER - FOOD"
         if vendorno == "21200Y":
             return "PEPSI TENDER - BEVERAGE"
         if vendorno == "21200E":
             return "PEPSI TENDER - QUAKER"
         return ""
 
-    # SOBEYS TENDER (template_flag = "template-1" or Null/empty)
+    # SOBEYS TENDER: template_flag = "template-1" or Null
     if _norm(template) in ("", "template-1"):
+        monday_stripped = monday_group.strip()
+        # 1. LA6: monday_group_name exactly this single string (not two separate checks)
+        if monday_stripped == MONDAY_GROUP_LA6_EXACT:
+            return "SOBEYS TENDER - LA6"
+        # 2. M&M: description contains "M&M" (exact substring, e.g. "M&M 514 Stuffed Potato Skins 1")
         if "M&M" in description:
             return "SOBEYS TENDER - M&M"
-        if "NPOP (LA6)" in monday_group and "MIFLAOPS" in monday_group:
-            return "SOBEYS TENDER - LA6"
-        # OTR: no M&M in description, monday_group_name does not have NPOP (LA6)/{MIFLAOPS}.pdf, consignee has RSC8/RSC9/RSC12/CFC3
-        npop_in_monday = "NPOP (LA6)" in monday_group or "MIFLAOPS" in monday_group
+        # 3. OTR: no M&M, monday_group_name not exactly LA6 string, consignee has RSC8/RSC9/RSC12/CFC3
         consignee_upper = consignee.upper()
-        if "M&M" not in description and not npop_in_monday:
-            if "RSC8" in consignee_upper or "RSC9" in consignee_upper or "RSC12" in consignee_upper or "CFC3" in consignee_upper:
-                return "SOBEYS TENDER - OTR"
-        return "SOBEYS TENDER - ADMIN"
+        if monday_stripped != MONDAY_GROUP_LA6_EXACT and (
+            "RSC8" in consignee_upper or "RSC9" in consignee_upper or "RSC12" in consignee_upper or "CFC3" in consignee_upper
+        ):
+            return "SOBEYS TENDER - OTR"
+        # 4. ADMIN: description has neither "M&M" nor "OTR"
+        if "M&M" not in description and "OTR" not in description:
+            return "SOBEYS TENDER - ADMIN"
+        return ""
 
     return ""
+
+
+DESTINATION_ID_COLUMN = "Destination ID (Altruos)"
+
+# Hardcoded destination IDs (Altruos) for resolving multiple Delivery API results.
+# Sobeys tender lookup: "Destination ID (Altruos)" from Sobeys table.
+SOBEYS_DESTINATION_IDS: Set[str] = {
+    "959", "960", "961", "962", "963", "964", "965", "966", "967", "968", "969",
+    "970", "971", "972", "973", "974", "975", "976", "977", "978", "979", "980",
+    "981", "982", "983", "984", "985", "986", "988", "989", "1119",
+}
+# Pepsi tender lookup: "Destination ID (Altruos)" from Pepsi table.
+PEPSI_DESTINATION_IDS: Set[str] = {
+    "769", "841", "842", "843", "846", "847", "848", "849", "850", "852", "861", "862",
+    "864", "865", "866", "867", "869", "875", "876", "881", "884", "885", "892", "893",
+    "894", "895", "896", "897", "898", "899", "900", "901", "902", "903", "904", "905",
+    "906", "907", "908", "909", "910", "924", "925", "926", "928", "929", "930", "931",
+    "936", "937", "938", "939", "940", "942", "943", "944", "950", "951", "952", "953",
+    "959", "960", "961", "962", "963", "964", "965", "966", "967", "968", "969", "970",
+    "971", "972", "973", "974", "975", "976", "977", "978", "979", "980", "981", "982",
+    "983", "984", "985", "986", "988", "989", "990", "992", "993", "994", "995", "996",
+    "997", "1000", "1009", "1010", "1011", "1012", "1014", "1015", "1016", "1018",
+    "1020", "1025", "1026", "1027", "1046", "1109", "1115", "1118", "1119", "1122", "1127",
+    "1128", "1129", "1130", "1136", "1386", "1625", "1748", "1784", "1924", "2320", "2333",
+}
+
+
+def load_destination_lookup(file_path: str) -> Set[str]:
+    """Load set of destination IDs from CSV or Excel. Column 'Destination ID (Altruos)'."""
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Destination lookup file not found: {file_path}")
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        df = pd.read_csv(path, dtype=str, encoding="utf-8")
+    elif suffix in (".xlsx", ".xls"):
+        df = pd.read_excel(path, engine="openpyxl" if suffix == ".xlsx" else None)
+    else:
+        raise ValueError(f"Destination lookup must be CSV or Excel, got {suffix}")
+    # Find column by name (case-insensitive, strip)
+    col = None
+    for c in df.columns:
+        if str(c).strip().lower() == DESTINATION_ID_COLUMN.lower():
+            col = c
+            break
+    if col is None:
+        raise ValueError(f"Column '{DESTINATION_ID_COLUMN}' not found in {file_path}. Columns: {list(df.columns)}")
+    ids = set()
+    for v in df[col].dropna().astype(str).str.strip():
+        if v:
+            ids.add(v)
+    return ids
+
+
+def _resolve_delivery_location(
+    location_results: List[Dict[str, Any]],
+    destination_id_set: Optional[Set[str]],
+) -> Dict[str, Any]:
+    """When Delivery API returns multiple locations, pick the first whose id is in the lookup set; else first."""
+    if not location_results:
+        raise ValueError("location_results is empty")
+    if not destination_id_set or len(location_results) == 1:
+        return location_results[0]
+    for loc in location_results:
+        lid = loc.get("id")
+        if lid is not None and str(lid).strip() in destination_id_set:
+            return loc
+    return location_results[0]
 
 
 def load_holidays(transit_time_xlsx_path: str) -> Set[date]:
@@ -292,12 +386,29 @@ def load_holidays(transit_time_xlsx_path: str) -> Set[date]:
 
 
 def parse_any_date(value: Any) -> Optional[date]:
-    """Parse common date formats (and Excel serial) into a date."""
+    """Parse common date formats (and Excel serial) into a date. Input CSV uses DD-MM-YYYY."""
     if value is None:
         return None
     s = str(value).strip()
     if not s:
         return None
+
+    # Explicit DD-MM-YYYY / DD/MM/YYYY (input CSV may use this)
+    for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y", "%d/%m/%y"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            if fmt in ("%d-%m-%y", "%d/%m/%y") and dt.year < 100:
+                dt = dt.replace(year=dt.year + 2000)
+            return dt.date()
+        except ValueError:
+            continue
+
+    # YYYY-MM-DD / YYYY/MM/DD (e.g. 2026/02/09 → 9 Feb 2026; avoid pandas interpreting as Sep 2)
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
 
     # Compact format e.g. "21726" = 21-7-26 → 2026-07-21 (DD-M-YY)
     if s.isdigit():
@@ -488,10 +599,10 @@ def build_shipment_payload(
             },
             "locations": {
                 "origin": str(pickup_result["id"]) if pickup_result and pickup_result.get("id") else "",
-                "destination": str(pickup_result["company_id"]) if pickup_result and pickup_result.get("company_id") else "",
+                "destination": str(delivery_result["id"]) if delivery_result and delivery_result.get("id") else "",
             },
             "parties": {
-                "customer": str(delivery_result["id"]) if delivery_result and delivery_result.get("id") else "",
+                "customer": str(pickup_result["company_id"]) if pickup_result and pickup_result.get("company_id") else "",
                 "client": str(delivery_result["company_id"]) if delivery_result and delivery_result.get("company_id") else "",
             },
             "service": {
@@ -501,7 +612,7 @@ def build_shipment_payload(
             },
         }
     else:
-        # Non-Pepsi (current) payload structure
+        # Non-Pepsi (current) payload structure; omit temperature when multiple/zero NPOP commodities (API rejects blank value)
         service_block: Dict[str, Any] = {
             "mode": mode_val,
             "service": "LTL",
@@ -521,15 +632,22 @@ def build_shipment_payload(
             },
             "locations": {
                 "origin": str(pickup_result["id"]) if pickup_result and pickup_result.get("id") else "",
-                "destination": str(pickup_result["company_id"]) if pickup_result and pickup_result.get("company_id") else "",
+                "destination": str(delivery_result["id"]) if delivery_result and delivery_result.get("id") else "",
             },
             "parties": {
-                "customer": str(delivery_result["id"]) if delivery_result and delivery_result.get("id") else "",
+                "customer": str(pickup_result["company_id"]) if pickup_result and pickup_result.get("company_id") else "",
                 "client": str(delivery_result["company_id"]) if delivery_result and delivery_result.get("company_id") else "",
             },
             "service": service_block,
         }
     return payload
+
+
+def _only_missing_delivery(errors: List[str]) -> bool:
+    """True when the only error is 'Missing Delivery location result' (so we still call shipment API)."""
+    if not errors or len(errors) != 1:
+        return False
+    return "Missing Delivery location result" in (errors[0] or "")
 
 
 def build_shipment_payloads(
@@ -557,6 +675,17 @@ def build_shipment_payloads(
     payloads = []
     for idx, row in df.iterrows():
         row_index = int(idx) + 1
+        # Cannot read address: do not create payload, do not run shipment API when either street is NULL or blank
+        if _is_street_null_or_blank(row.get("shipfrom_street")) or _is_street_null_or_blank(row.get("shipto_street")):
+            payloads.append({
+                "row_index": row_index,
+                "payload": {},
+                "payload_type": "pepsi" if _norm(_cell_str(row.get("template_flag"))) == "pepsi" else "non_pepsi",
+                "errors": ["Cannot read address (street is NULL)"],
+                "cannot_read_address": True,
+            })
+            continue
+
         pickup_res = by_row.get(row_index, {}).get("Pickup")
         delivery_res = by_row.get(row_index, {}).get("Delivery")
         is_pepsi = _norm(_cell_str(row.get("template_flag"))) == "pepsi"
@@ -575,16 +704,12 @@ def build_shipment_payloads(
             holidays,
             is_pepsi=is_pepsi,
         )
-        cannot_read_address = any(
-            r.get("row_index") == row_index and r.get("error") == ERROR_EMPTY_LOCATIONS_ADDRESS
-            for r in location_results
-        )
         payloads.append({
             "row_index": row_index,
             "payload": payload,
             "payload_type": "pepsi" if is_pepsi else "non_pepsi",
             "errors": errors if errors else None,
-            "cannot_read_address": cannot_read_address,
+            "cannot_read_address": False,
         })
 
     return payloads
@@ -615,6 +740,7 @@ OUTPUT_CSV_COLUMNS = [
     "Status",
     "Load Number (Pepsi)",
     "Order # (Pepsi)",
+    "monday_group_name",
 ]
 
 # Status values for output CSV (normal, error, Pepsi-specific)
@@ -666,26 +792,31 @@ def _compute_output_status(
 ) -> str:
     """
     Compute Status for output CSV: validation errors first, then Pepsi-specific, then API result.
+
+    - Cannot read address (ERROR): when shipto_street or shipfrom_street was NULL. Pickup and Delivery APIs are not run; no payload created, shipment API not run.
+    - Dest. Missing (ERROR): when no response from Delivery API. Payload is created and shipment creation API is run.
     """
     errors = item.get("errors") or []
     is_pepsi = item.get("payload_type") == "pepsi"
 
-    # Street address unreadable: API returned {"locations": []} for Pickup or Delivery
+    # Street was NULL → placeholder row; no payload, no shipment API; Status = Cannot read address (ERROR)
     if item.get("cannot_read_address"):
         return STATUS_CANNOT_READ_ADDRESS
 
-    # Payload build errors (missing Pickup/Delivery location result)
+    # No response from Delivery API (no destination) → Dest. Missing (ERROR)
+    dest = _payload_get(payload, "locations", "destination")
+    if not (dest or "").strip():
+        return STATUS_DEST_MISSING
+    if errors and any("Delivery" in e for e in errors):
+        return STATUS_DEST_MISSING
+
+    # Payload build errors (missing Pickup location result only)
     if errors:
-        if any("Delivery" in e for e in errors):
-            return STATUS_DEST_MISSING
         return STATUS_ALIAS_LOOKUP_FAILURE
 
     # Required fields (input or payload)
     if not (cell_fn("vendorno") or "").strip():
         return STATUS_VENDOR_MISSING
-    dest = _payload_get(payload, "locations", "destination")
-    if not (dest or "").strip():
-        return STATUS_DEST_MISSING
     pickup_date = _payload_get(payload, "dates", "pickup_date")
     if not (pickup_date or "").strip():
         return STATUS_PICKUP_DATE_MISSING
@@ -755,6 +886,24 @@ def write_output_csv(
     """
     Write one row per payload to output CSV. Column mapping from payload + input row + create_response.
     """
+    # Precompute multi-PO descriptions: item_id with exactly 2 rows -> "(Multi PO tender, POs: x & y)"
+    item_id_to_rows: Dict[str, List[Tuple[int, str]]] = {}
+    for item in payloads:
+        row_index = item.get("row_index", 1)
+        try:
+            input_row = df.iloc[row_index - 1]
+        except (IndexError, KeyError):
+            input_row = {}
+        item_id_val = _cell_str(input_row.get("item_id") if hasattr(input_row, "get") else "") or ""
+        po_val = _cell_str(input_row.get("po") if hasattr(input_row, "get") else "") or ""
+        if (item_id_val or "").strip():
+            item_id_to_rows.setdefault((item_id_val or "").strip(), []).append((row_index, po_val))
+    multi_po_descriptions: Dict[str, str] = {}
+    for iid, rows in item_id_to_rows.items():
+        if len(rows) == 2:
+            po1, po2 = rows[0][1], rows[1][1]
+            multi_po_descriptions[iid] = f"(Multi PO tender, POs: {po1} & {po2})"
+
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
@@ -770,6 +919,13 @@ def write_output_csv(
             def cell(col: str) -> str:
                 v = input_row.get(col) if hasattr(input_row, "get") else ""
                 return _cell_str(v) or ""
+
+            def cell_lifts_pallets(col: str) -> str:
+                """Return cell value; use '0' when value is NULL or empty (for output CSV)."""
+                v = cell(col)
+                if not (v or "").strip() or str(v).strip().upper() == "NULL":
+                    return "0"
+                return v
 
             json_response = create_response.get("body", "")
             api_result = create_response.get("message", "")
@@ -787,19 +943,36 @@ def write_output_csv(
             load_number_pepsi = cell("invoiceRef") if is_pepsi else ""
             order_pepsi = cell("po") if is_pepsi else ""
 
+            # Description: success → "Shipment created successfully by BOT"; duplicate PO → "Duplicate Po"; same item_id in 2 rows → "(Multi PO tender, POs: x & y)"; else blank
+            description_val = ""
+            if create_response:
+                body_str = (create_response.get("body") or "").strip()
+                msg_upper = (create_response.get("message") or "").upper()
+                is_duplicate = (
+                    "SHIP.PO.DUPLICATE" in body_str
+                    or "ALREADY EXISTS" in msg_upper
+                    or "DUPLICATE" in msg_upper
+                )
+                if create_response.get("success") and not is_duplicate:
+                    description_val = "Shipment created successfully by BOT"
+                elif is_duplicate:
+                    description_val = "Duplicate Po"
+            if not description_val and (cell("item_id") or "").strip() in multi_po_descriptions:
+                description_val = multi_po_descriptions[(cell("item_id") or "").strip()]
+
             writer.writerow({
                 "Item ID": cell("item_id"),
                 "JSON Request": json.dumps(payload, ensure_ascii=False),
                 "JSON Response": json_response,
-                "Description": cell("description"),
+                "Description": description_val,
                 "Purchase Order": cell("po"),
                 "Vendor #": cell("vendorno"),
                 "Pick Up Date": _payload_get(payload, "dates", "pickup_date"),
                 "Delivery Date": _payload_get(payload, "dates", "delivery_date"),
                 "Weight": cell("weight"),
                 "Cube": cell("cubes"),
-                "Lifts": cell("lifts"),
-                "Pallets": cell("pallets"),
+                "Lifts": cell_lifts_pallets("lifts"),
+                "Pallets": cell_lifts_pallets("pallets"),
                 "Origin / Load At": _payload_get(payload, "locations", "origin"),
                 "Destination / Delivery Location": _payload_get(payload, "locations", "destination"),
                 "Customer / PickUp Company": _payload_get(payload, "parties", "customer"),
@@ -811,6 +984,7 @@ def write_output_csv(
                 "Status": status,
                 "Load Number (Pepsi)": load_number_pepsi,
                 "Order # (Pepsi)": order_pepsi,
+                "monday_group_name": cell("monday_group_name"),
             })
     logger.info("Wrote output CSV: %s (%d rows)", output_path, len(payloads))
 
@@ -903,6 +1077,10 @@ def location_search(
         or "https://siwy6vb99l.execute-api.ca-central-1.amazonaws.com/qa/location-module/location/search"
     )
 
+    # Hardcoded destination lookups to resolve multiple Delivery locations (pick first whose id is in table)
+    sobeys_dest_set: Optional[Set[str]] = SOBEYS_DESTINATION_IDS if run_both else None
+    pepsi_dest_set: Optional[Set[str]] = PEPSI_DESTINATION_IDS if run_both else None
+
     def _cell_str(val: Any) -> str:
         if val is None or (isinstance(val, float) and pd.isna(val)):
             return ""
@@ -927,25 +1105,45 @@ def location_search(
 
     df = df[df.apply(_row_has_any_key, axis=1)].reset_index(drop=True)
 
-    def _empty_result(row_index: int, error: str, loc_type: str) -> Dict[str, Any]:
-        return {
+    def _empty_result(
+        row_index: int,
+        error: str,
+        loc_type: str,
+        street_address: Optional[str] = None,
+        alias_source: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
             "row_index": row_index,
             "id": None,
             "company_id": None,
             "province": None,
             "location_type": loc_type,
+            "street_address": street_address or "",
             "error": error,
         }
+        if alias_source is not None:
+            out["alias_source"] = alias_source
+        return out
 
-    def _success_result(row_index: int, loc: Dict[str, Any], loc_type: str) -> Dict[str, Any]:
-        return {
+    def _success_result(
+        row_index: int,
+        loc: Dict[str, Any],
+        loc_type: str,
+        street_address: Optional[str] = None,
+        alias_source: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
             "row_index": row_index,
             "id": loc["id"],
             "company_id": loc["company_id"],
             "province": loc["province"],
             "location_type": loc_type,
+            "street_address": street_address or "",
             "error": None,
         }
+        if alias_source is not None:
+            out["alias_source"] = alias_source
+        return out
 
     results: List[Dict[str, Any]] = []
     for idx, row in df.iterrows():
@@ -954,6 +1152,17 @@ def location_search(
         alias_value_val = _cell_str(row.get(alias_value_col))
         ship_from_val = _cell_str(row.get(ship_from_col))
         ship_to_val = _cell_str(row.get(ship_to_col)) if run_both or location_type == LOCATION_TYPE_DELIVERY else ""
+
+        # Cannot read address: do not run Pickup or Delivery API when either street is NULL or blank
+        if run_both and (_is_street_null_or_blank(ship_from_val) or _is_street_null_or_blank(ship_to_val)):
+            results.append(_empty_result(row_index, "Cannot read address (street is NULL)", LOCATION_TYPE_BOTH, street_address="", alias_source=None))
+            continue
+        if not run_both and location_type == LOCATION_TYPE_PICKUP and _is_street_null_or_blank(ship_from_val):
+            results.append(_empty_result(row_index, "Cannot read address (street is NULL)", LOCATION_TYPE_PICKUP, street_address=ship_from_val or "", alias_source=alias_source_val or None))
+            continue
+        if not run_both and location_type == LOCATION_TYPE_DELIVERY and _is_street_null_or_blank(ship_to_val):
+            results.append(_empty_result(row_index, "Cannot read address (street is NULL)", LOCATION_TYPE_DELIVERY, street_address=ship_to_val or "", alias_source=None))
+            continue
 
         types_to_run: List[str] = []
         if run_both:
@@ -969,15 +1178,17 @@ def location_search(
 
         if not types_to_run:
             if run_both:
-                results.append(_empty_result(row_index, "Missing required fields for both Pickup and Delivery", LOCATION_TYPE_BOTH))
+                results.append(_empty_result(row_index, "Missing required fields for both Pickup and Delivery", LOCATION_TYPE_BOTH, street_address="", alias_source=None))
             elif location_type == LOCATION_TYPE_PICKUP:
-                results.append(_empty_result(row_index, "Missing required field (alias_source derived from template_flag/vendorno/description/monday_group_name/consignee, vendorno, or shipfrom_street)", LOCATION_TYPE_PICKUP))
+                results.append(_empty_result(row_index, "Missing required field (alias_source derived from template_flag/vendorno/description/monday_group_name/consignee, vendorno, or shipfrom_street)", LOCATION_TYPE_PICKUP, street_address=ship_from_val or "", alias_source=alias_source_val or None))
             else:
-                results.append(_empty_result(row_index, "Missing required field (ship_to_street_address)", LOCATION_TYPE_DELIVERY))
+                results.append(_empty_result(row_index, "Missing required field (ship_to_street_address)", LOCATION_TYPE_DELIVERY, street_address=ship_to_val or "", alias_source=None))
             continue
 
         for run_type in types_to_run:
+            # Pickup: street_address = shipfrom_street. Delivery: street_address = shipto_street (strictly)
             street_val = ship_from_val if run_type == LOCATION_TYPE_PICKUP else ship_to_val
+            alias_for_result = alias_source_val if run_type == LOCATION_TYPE_PICKUP else None
             try:
                 response = search_location(
                     access_token=access_token,
@@ -991,14 +1202,20 @@ def location_search(
                 location_results = extract_location_results(response)
                 if not location_results:
                     err_msg = ERROR_EMPTY_LOCATIONS_ADDRESS if response.get("locations") == [] else "No locations in response"
-                    results.append(_empty_result(row_index, err_msg, run_type))
+                    results.append(_empty_result(row_index, err_msg, run_type, street_address=street_val, alias_source=alias_for_result))
                 else:
-                    for loc in location_results:
-                        results.append(_success_result(row_index, loc, run_type))
+                    # One result per (row, type). For Delivery with multiple locations, pick first whose id is in lookup table.
+                    if run_type == LOCATION_TYPE_DELIVERY and len(location_results) > 1:
+                        is_pepsi_row = _norm(_cell_str(row.get("template_flag"))) == "pepsi"
+                        dest_set = pepsi_dest_set if is_pepsi_row else sobeys_dest_set
+                        loc = _resolve_delivery_location(location_results, dest_set)
+                    else:
+                        loc = location_results[0]
+                    results.append(_success_result(row_index, loc, run_type, street_address=street_val, alias_source=alias_for_result))
             except requests.RequestException as e:
-                results.append(_empty_result(row_index, str(e), run_type))
+                results.append(_empty_result(row_index, str(e), run_type, street_address=street_val, alias_source=alias_for_result))
             except Exception as e:
-                results.append(_empty_result(row_index, str(e), run_type))
+                results.append(_empty_result(row_index, str(e), run_type, street_address=street_val, alias_source=alias_for_result))
 
     result_data: Dict[str, Any] = {
         "locations": results,
@@ -1028,7 +1245,14 @@ def location_search(
         shipment_config = config.get("shipment_api")
         if shipment_config and isinstance(shipment_config, dict):
             for item in payloads:
-                if item.get("errors"):
+                if item.get("cannot_read_address"):
+                    item["create_response"] = {
+                        "status_code": 0,
+                        "body": "",
+                        "success": False,
+                        "message": "Skipped (Cannot read address - street is NULL)",
+                    }
+                elif item.get("errors") and not _only_missing_delivery(item.get("errors")):
                     item["create_response"] = {
                         "status_code": 0,
                         "body": "",
