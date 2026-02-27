@@ -39,6 +39,11 @@ LOCATION_TYPE_PICKUP = "Pickup"
 LOCATION_TYPE_DELIVERY = "Delivery"
 LOCATION_TYPE_BOTH = "both"  # Run both Pickup and Delivery in one execution
 
+# Delivery exception: same street "260199 High Plains Blvd" for RSC40 and RSC50; use alias to disambiguate
+DELIVERY_EXCEPTION_STREET_NORMALIZED = "260199 HIGH PLAINS BLVD"
+DELIVERY_EXCEPTION_ALIAS_SOURCE = "Sobeys Destination"
+DELIVERY_EXCEPTION_CONSIGNEES = ("RSC40", "RSC50")
+
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     """Load config from the given path. config_path is required (config contains secrets and should not be in repo)."""
@@ -168,7 +173,7 @@ def search_location(
         "include_commodities": include_commodities,
         "type": search_type,
     }
-    if search_type == LOCATION_TYPE_PICKUP and alias_source is not None and alias_value is not None:
+    if alias_source is not None and alias_value is not None:
         payload["alias_source"] = alias_source
         payload["alias_value"] = str(alias_value)
     resp = requests.post(search_url, headers=headers, json=payload, timeout=30)
@@ -177,7 +182,7 @@ def search_location(
 
 
 def extract_location_results(api_response: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """From location/search response, return list of {id, company_id, province, commodities} for each location."""
+    """From location/search response, return list of {id, company_id, province, commodities, location_name, alias_source} for each location."""
     locations = api_response.get("locations") or []
     out = []
     for loc in locations:
@@ -189,11 +194,20 @@ def extract_location_results(api_response: Dict[str, Any]) -> List[Dict[str, Any
             for c in commodities_raw
             if c.get("temperature_requirement")
         ]
+        location_name = (loc.get("location_name") or "").strip() or ""
+        alias_source = ""
+        location_alias = loc.get("location_alias") or []
+        if location_alias and isinstance(location_alias, list) and len(location_alias) > 0:
+            first_alias = location_alias[0]
+            if isinstance(first_alias, dict) and first_alias.get("alias_source"):
+                alias_source = str(first_alias.get("alias_source", "")).strip()
         out.append({
             "id": loc.get("id"),
             "company_id": loc.get("company_id"),
             "province": province,
             "commodities": temperature_requirements,
+            "location_name": location_name,
+            "alias_source": alias_source,
         })
     return out
 
@@ -636,7 +650,7 @@ def build_shipment_payload(
             },
             "parties": {
                 "customer": str(pickup_result["company_id"]) if pickup_result and pickup_result.get("company_id") else "",
-                "client": str(delivery_result["company_id"]) if delivery_result and delivery_result.get("company_id") else "",
+                "client": "240",  # non-Pepsi: always 240
             },
             "service": service_block,
         }
@@ -675,6 +689,19 @@ def build_shipment_payloads(
     payloads = []
     for idx, row in df.iterrows():
         row_index = int(idx) + 1
+        # Excluded vendors (priority over Cannot read address): do not create payload, do not run shipment API; custom status
+        vendorno_raw = (_cell_str(row.get("vendorno")) or "").strip()
+        if vendorno_raw in EXCLUDED_VENDOR_STATUS:
+            payloads.append({
+                "row_index": row_index,
+                "payload": {},
+                "payload_type": "pepsi" if _norm(_cell_str(row.get("template_flag"))) == "pepsi" else "non_pepsi",
+                "errors": None,
+                "cannot_read_address": False,
+                "excluded_vendor_status": EXCLUDED_VENDOR_STATUS[vendorno_raw],
+            })
+            continue
+
         # Cannot read address: do not create payload, do not run shipment API when either street is NULL or blank
         if _is_street_null_or_blank(row.get("shipfrom_street")) or _is_street_null_or_blank(row.get("shipto_street")):
             payloads.append({
@@ -710,6 +737,9 @@ def build_shipment_payloads(
             "payload_type": "pepsi" if is_pepsi else "non_pepsi",
             "errors": errors if errors else None,
             "cannot_read_address": False,
+            "pickup_location_name": (pickup_res.get("location_name") or "").strip() if pickup_res else "",
+            "delivery_location_name": (delivery_res.get("location_name") or "").strip() if delivery_res else "",
+            "pickup_alias_source": (pickup_res.get("alias_source") or "").strip() if pickup_res else "",
         })
 
     return payloads
@@ -741,6 +771,10 @@ OUTPUT_CSV_COLUMNS = [
     "Load Number (Pepsi)",
     "Order # (Pepsi)",
     "monday_group_name",
+    "Pickup Alias Lookup Request",
+    "Pickup Alias Lookup Response",
+    "Dest. Alias Lookup Request",
+    "Dest. Alias Lookup Response",
 ]
 
 # Status values for output CSV (normal, error, Pepsi-specific)
@@ -773,6 +807,12 @@ STATUS_CANNOT_READ_ADDRESS = "Cannot read address (ERROR)"
 # Error message stored in location result when API returns {"locations": []}
 ERROR_EMPTY_LOCATIONS_ADDRESS = "Cannot read address"
 
+# Vendors for which we do not create payload or call shipment API; custom status per vendor (row still written to output CSV).
+EXCLUDED_VENDOR_STATUS: Dict[str, str] = {
+    "201286": "Haleon , shipment is not to be created",
+    "212346": "Lindt, shipment is not to be created",
+}
+
 
 def _payload_get(payload: Dict[str, Any], *keys: str, default: str = "") -> str:
     """Get nested value from payload, e.g. _payload_get(p, 'dates', 'pickup_date')."""
@@ -798,6 +838,10 @@ def _compute_output_status(
     """
     errors = item.get("errors") or []
     is_pepsi = item.get("payload_type") == "pepsi"
+
+    # Excluded vendor (priority): no payload, no shipment API; custom status (Haleon / Lindt)
+    if item.get("excluded_vendor_status"):
+        return item["excluded_vendor_status"]
 
     # Street was NULL → placeholder row; no payload, no shipment API; Status = Cannot read address (ERROR)
     if item.get("cannot_read_address"):
@@ -882,10 +926,12 @@ def write_output_csv(
     df: pd.DataFrame,
     payloads: List[Dict[str, Any]],
     _cell_str: Any,
+    api_request_response_by_row: Optional[Dict[int, Dict[str, Dict[str, Any]]]] = None,
 ) -> None:
     """
     Write one row per payload to output CSV. Column mapping from payload + input row + create_response.
     """
+    api_by_row = api_request_response_by_row or {}
     # Precompute multi-PO descriptions: item_id with exactly 2 rows -> "(Multi PO tender, POs: x & y)"
     item_id_to_rows: Dict[str, List[Tuple[int, str]]] = {}
     for item in payloads:
@@ -960,6 +1006,8 @@ def write_output_csv(
             if not description_val and (cell("item_id") or "").strip() in multi_po_descriptions:
                 description_val = multi_po_descriptions[(cell("item_id") or "").strip()]
 
+            row_api = api_by_row.get(row_index, {})
+
             writer.writerow({
                 "Item ID": cell("item_id"),
                 "JSON Request": json.dumps(payload, ensure_ascii=False),
@@ -973,10 +1021,10 @@ def write_output_csv(
                 "Cube": cell("cubes"),
                 "Lifts": cell_lifts_pallets("lifts"),
                 "Pallets": cell_lifts_pallets("pallets"),
-                "Origin / Load At": _payload_get(payload, "locations", "origin"),
-                "Destination / Delivery Location": _payload_get(payload, "locations", "destination"),
-                "Customer / PickUp Company": _payload_get(payload, "parties", "customer"),
-                "Client / Consignee": _payload_get(payload, "parties", "client"),
+                "Origin / Load At": (item.get("pickup_location_name") or "").strip(),
+                "Destination / Delivery Location": (item.get("delivery_location_name") or "").strip(),
+                "Customer / PickUp Company": (item.get("pickup_alias_source") or "").strip(),
+                "Client / Consignee": "PEPSI" if is_pepsi else "SOBEYS",
                 "Mode": _payload_get(payload, "service", "mode"),
                 "Service": _payload_get(payload, "service", "service"),
                 "Temperature": temperature,
@@ -985,6 +1033,10 @@ def write_output_csv(
                 "Load Number (Pepsi)": load_number_pepsi,
                 "Order # (Pepsi)": order_pepsi,
                 "monday_group_name": cell("monday_group_name"),
+                "Pickup Alias Lookup Request": json.dumps(row_api.get("Pickup", {}).get("request", {}), ensure_ascii=False) if row_api else "",
+                "Pickup Alias Lookup Response": json.dumps(row_api.get("Pickup", {}).get("response", {}), ensure_ascii=False) if row_api else "",
+                "Dest. Alias Lookup Request": json.dumps(row_api.get("Delivery", {}).get("request", {}), ensure_ascii=False) if row_api else "",
+                "Dest. Alias Lookup Response": json.dumps(row_api.get("Delivery", {}).get("response", {}), ensure_ascii=False) if row_api else "",
             })
     logger.info("Wrote output CSV: %s (%d rows)", output_path, len(payloads))
 
@@ -1136,18 +1188,20 @@ def location_search(
             "row_index": row_index,
             "id": loc["id"],
             "company_id": loc["company_id"],
-            "province": loc["province"],
+            "province": loc.get("province"),
             "location_type": loc_type,
             "street_address": street_address or "",
             "error": None,
+            "location_name": loc.get("location_name") or "",
+            "alias_source": loc.get("alias_source") or alias_source or "",
         }
-        if alias_source is not None:
-            out["alias_source"] = alias_source
         return out
 
     results: List[Dict[str, Any]] = []
+    api_request_response_by_row: Dict[int, Dict[str, Dict[str, Any]]] = {}
     for idx, row in df.iterrows():
         row_index = int(idx) + 1
+        api_request_response_by_row[row_index] = {}
         alias_source_val = get_alias_source_from_row(row, _cell_str)
         alias_value_val = _cell_str(row.get(alias_value_col))
         ship_from_val = _cell_str(row.get(ship_from_col))
@@ -1189,16 +1243,36 @@ def location_search(
             # Pickup: street_address = shipfrom_street. Delivery: street_address = shipto_street (strictly)
             street_val = ship_from_val if run_type == LOCATION_TYPE_PICKUP else ship_to_val
             alias_for_result = alias_source_val if run_type == LOCATION_TYPE_PICKUP else None
+            request_dict: Dict[str, Any] = {
+                "street_address": street_val.strip(),
+                "include_commodities": include_commodities,
+                "type": run_type,
+            }
+            delivery_alias_source: Optional[str] = None
+            delivery_alias_value: Optional[str] = None
+            if run_type == LOCATION_TYPE_PICKUP and alias_source_val and alias_value_val:
+                request_dict["alias_source"] = alias_source_val
+                request_dict["alias_value"] = str(alias_value_val)
+            elif run_type == LOCATION_TYPE_DELIVERY:
+                # Exception: 260199 High Plains Blvd with consignee RSC40 or RSC50 → use Sobeys Destination alias
+                street_norm = " ".join((street_val or "").strip().upper().split())
+                consignee_val = (_cell_str(row.get("consignee")) or "").strip().upper()
+                if street_norm == DELIVERY_EXCEPTION_STREET_NORMALIZED and consignee_val in DELIVERY_EXCEPTION_CONSIGNEES:
+                    delivery_alias_source = DELIVERY_EXCEPTION_ALIAS_SOURCE
+                    delivery_alias_value = consignee_val
+                    request_dict["alias_source"] = delivery_alias_source
+                    request_dict["alias_value"] = delivery_alias_value
             try:
                 response = search_location(
                     access_token=access_token,
                     search_url=search_url,
                     street_address=street_val,
                     search_type=run_type,
-                    alias_source=alias_source_val if run_type == LOCATION_TYPE_PICKUP else None,
-                    alias_value=alias_value_val if run_type == LOCATION_TYPE_PICKUP else None,
+                    alias_source=alias_source_val if run_type == LOCATION_TYPE_PICKUP else delivery_alias_source,
+                    alias_value=alias_value_val if run_type == LOCATION_TYPE_PICKUP else delivery_alias_value,
                     include_commodities=include_commodities,
                 )
+                api_request_response_by_row[row_index][run_type] = {"request": request_dict, "response": response}
                 location_results = extract_location_results(response)
                 if not location_results:
                     err_msg = ERROR_EMPTY_LOCATIONS_ADDRESS if response.get("locations") == [] else "No locations in response"
@@ -1252,6 +1326,13 @@ def location_search(
                         "success": False,
                         "message": "Skipped (Cannot read address - street is NULL)",
                     }
+                elif item.get("excluded_vendor_status"):
+                    item["create_response"] = {
+                        "status_code": 0,
+                        "body": "",
+                        "success": False,
+                        "message": f"Skipped ({item['excluded_vendor_status']})",
+                    }
                 elif item.get("errors") and not _only_missing_delivery(item.get("errors")):
                     item["create_response"] = {
                         "status_code": 0,
@@ -1268,7 +1349,7 @@ def location_search(
 
         if output_csv_path:
             try:
-                write_output_csv(output_csv_path, df, payloads, _cell_str)
+                write_output_csv(output_csv_path, df, payloads, _cell_str, api_request_response_by_row)
                 result_data["output_csv_path"] = output_csv_path
             except Exception as e:
                 logger.exception("Failed to write output CSV")
