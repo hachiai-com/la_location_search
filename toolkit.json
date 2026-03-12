@@ -35,10 +35,6 @@
             "type": "boolean",
             "description": "For Pickup only. Default true."
           },
-          "transit_time_xlsx_path": {
-            "type": "string",
-            "description": "Absolute path to 'Transit Time - BOT (PROD).xlsx' (Holidays sheet). Required for payload date adjustment when running both."
-          },
           "output_csv_path": {
             "type": "string",
             "description": "Optional. When running both: write one row per payload to this CSV (Item ID, JSON Request, JSON Response, Description, PO, Vendor #, dates, quantities, origin/destination, parties, service, API Call Result, etc.)."
