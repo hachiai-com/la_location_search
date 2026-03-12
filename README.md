@@ -81,13 +81,13 @@ When `location_type` is omitted or set to `"both"`, **one execution runs both Pi
    CSV must have: `vendorno`, `shipfrom_street`, `shipto_street`, `template_flag`, `description`, `monday_group_name`, `consignee`. **Required:** `csv_path`, `config_path`.
 
    ```powershell
-   echo '{"capability":"location_search","args":{"csv_path":"C:\\Users\\neeha\\Downloads\\test_data.csv","config_path":"C:\\path\\to\\your\\config.json","transit_time_xlsx_path":"C:\\path\\to\\Transit Time - BOT (PROD).xlsx"}}' | python main.py
+   echo '{"capability":"location_search","args":{"csv_path":"C:\\Users\\neeha\\Downloads\\test_data.csv","config_path":"C:\\path\\to\\your\\config.json"}}' | python main.py
    ```
 
    To write an **output CSV** with one row per payload (request/response, description, PO, vendor, dates, weight, cube, origin/destination, customer/client, mode, service, temperature, API call result):
 
    ```powershell
-   echo '{"capability":"location_search","args":{"csv_path":"C:\\...\\test_data.csv","config_path":"C:\\...\\your_config.json","transit_time_xlsx_path":"C:\\...\\Transit Time - BOT (PROD).xlsx","output_csv_path":"C:\\...\\output_sheet.csv"}}' | python main.py
+   echo '{"capability":"location_search","args":{"csv_path":"C:\\Users\\neeha\\Downloads\\la_shipment_creation_working_table.csv","config_path":"C:\\Users\\neeha\\Downloads\\toolkits\\la_location_search\\config.json","output_csv_path":"C:\\Users\\neeha\\Downloads\\output_sheet.csv"}}' | python main.py
    ```
 
 4. **Run only Pickup or only Delivery**
@@ -113,7 +113,6 @@ When `location_type` is omitted or set to `"both"`, **one execution runs both Pi
 - **Failure**: JSON with `error` and `capability` (e.g. missing config, CSV not found, wrong columns, auth failure).
 - When running both, output also includes:
   - `result.payloads`: one shipment payload per CSV row. If **shipment_api** is in config, each item has `create_response`: `{ status_code, body, success, message }` from the shipment create API.
-  - `result.payload_setup_errors`: present if the holiday list could not be loaded
   - `result.output_csv_path`: set when `output_csv_path` was provided and the file was written successfully
   - `result.output_csv_error`: set if writing the output CSV failed
 
@@ -213,6 +212,6 @@ When `output_csv_path` is provided, one row per payload is written with these co
 | Service | Payload `service.service` |
 | Temperature | Payload `service.temperature` |
 | API Call Result | Shipment API result message (success, error, skipped, or "Not sent" if API not configured) |
-| Status | One of: In Queue, Created, PO already exists in Altruos, Retry; or error statuses (Vendor # Missing, Dest. Missing, PICKUP/DELIVERY Date Missing, Cube/Weight/Cases Missing, Missing Temp, Missing Mode, JSON not sent, Customer Missing, Cannot read address (ERROR), ERROR); or Pepsi-specific (Pallets/Load Number/Client/Order # Missing (Pepsi)). **Cannot read address (ERROR)** is set when the location/search API returns `{"locations": []}` for the given street_address (Pickup or Delivery). |
+| Status | One of: In Queue, Created, PO already exists in Altruos, Retry; or error statuses (Vendor # Missing, Dest. Missing, PICKUP/DELIVERY Date Missing, Cube/Weight/Cases Missing, Missing Temp, Missing Mode, JSON not sent, Customer Missing, Cannot read address (ERROR), **Pickup Alias Lookup failure (ERROR)**, **Destination Alias Lookup failure (ERROR)**, **Pickup and Destination Alias Lookup failure (ERROR)**, ERROR); or Pepsi-specific (Pallets/Load Number/Client/Order # Missing (Pepsi)). **Pickup Alias Lookup failure (ERROR)** when only Pickup API returns empty; **Destination Alias Lookup failure (ERROR)** when only Delivery/Destination API returns empty; **Pickup and Destination Alias Lookup failure (ERROR)** when both return empty; **Cannot read address (ERROR)** when shipto (Delivery alias) is NULL. |
 | Load Number (Pepsi) | Input CSV `invoiceRef` (Pepsi rows only; empty for non-Pepsi) |
 | Order # (Pepsi) | Input CSV `po` (Pepsi rows only; empty for non-Pepsi) |
