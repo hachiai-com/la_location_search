@@ -1041,6 +1041,9 @@ STATUS_DEST_NAME_NO_MATCH = "Destination name does NOT match (ERROR)"
 STATUS_PO_NOT_FOUND = "PO not FOUND (ERROR)"
 STATUS_UNREADABLE_FILE = "Unreadable File"
 STATUS_ALIAS_LOOKUP_FAILURE = "Alias Lookup failure (ERROR)"
+STATUS_PICKUP_ALIAS_LOOKUP_FAILURE = "Pickup Alias Lookup failure (ERROR)"
+STATUS_DESTINATION_ALIAS_LOOKUP_FAILURE = "Destination Alias Lookup failure (ERROR)"
+STATUS_PICKUP_AND_DESTINATION_ALIAS_LOOKUP_FAILURE = "Pickup and Destination Alias Lookup failure (ERROR)"
 STATUS_CUSTOMER_MISSING = "Customer Missing"
 STATUS_ERROR_GENERIC = "ERROR (generic catch-all)"
 STATUS_PALLETS_MISSING_PEPSI = "Pallets Missing (Pepsi)"
@@ -1090,9 +1093,17 @@ def _compute_output_status(
     if item.get("cannot_read_address"):
         return STATUS_CANNOT_READ_ADDRESS
 
-    # Pickup or Delivery API returned empty → Alias Lookup failure (do not call shipment create API)
+    # Pickup or Delivery API returned empty → specific status (no generic alias lookup failure)
     if errors:
-        return STATUS_ALIAS_LOOKUP_FAILURE
+        has_pickup_failure = "Missing Pickup location result" in errors
+        has_delivery_failure = "Missing Delivery location result" in errors
+        if has_pickup_failure and has_delivery_failure:
+            return STATUS_PICKUP_AND_DESTINATION_ALIAS_LOOKUP_FAILURE
+        if has_pickup_failure:
+            return STATUS_PICKUP_ALIAS_LOOKUP_FAILURE
+        if has_delivery_failure:
+            return STATUS_DESTINATION_ALIAS_LOOKUP_FAILURE
+        return STATUS_ALIAS_LOOKUP_FAILURE  # any other error list content
 
     # No destination in payload (edge case)
     dest = _payload_get(payload, "locations", "destination")
@@ -1268,7 +1279,6 @@ def location_search(
     config_path: Optional[str] = None,
     location_type: str = LOCATION_TYPE_BOTH,
     include_commodities: bool = True,
-    transit_time_xlsx_path: Optional[str] = None,
     output_csv_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -1526,23 +1536,9 @@ def location_search(
         "location_type": LOCATION_TYPE_BOTH if run_both else location_type,
     }
 
-    # Build shipment payloads when running both Pickup and Delivery
+    # Build shipment payloads when running both Pickup and Delivery (no holiday adjustment)
     if run_both:
-        holidays: Optional[Set[date]] = None
-
-        payload_errors: List[str] = []
-        if transit_time_xlsx_path:
-            try:
-                holidays = load_holidays(transit_time_xlsx_path)
-            except Exception as e:
-                payload_errors.append(f"Failed to load holidays: {e}")
-        else:
-            payload_errors.append("Missing transit_time_xlsx_path (needed to adjust pickup_date for holidays/weekends)")
-
-        if payload_errors:
-            result_data["payload_setup_errors"] = payload_errors
-
-        payloads = build_shipment_payloads(df, results, _cell_str, holidays)
+        payloads = build_shipment_payloads(df, results, _cell_str, holidays=None)
 
         # Optional: call shipment create API for each payload if config has shipment_api
         shipment_config = config.get("shipment_api")
@@ -1563,12 +1559,23 @@ def location_search(
                         "message": f"Skipped ({item['excluded_vendor_status']})",
                     }
                 elif item.get("errors"):
-                    # Alias Lookup failure: Pickup or Delivery API returned empty → do not call shipment create API
+                    # Pickup or Destination alias lookup failure → do not call shipment create API
+                    errs = item.get("errors") or []
+                    has_pickup = "Missing Pickup location result" in errs
+                    has_delivery = "Missing Delivery location result" in errs
+                    if has_pickup and has_delivery:
+                        msg = "Skipped (Pickup and Destination Alias Lookup failure)"
+                    elif has_pickup:
+                        msg = "Skipped (Pickup Alias Lookup failure)"
+                    elif has_delivery:
+                        msg = "Skipped (Destination Alias Lookup failure)"
+                    else:
+                        msg = "Skipped (Alias Lookup failure)"
                     item["create_response"] = {
                         "status_code": 0,
                         "body": "",
                         "success": False,
-                        "message": "Skipped (Alias Lookup failure - Pickup or Delivery API returned empty)",
+                        "message": msg,
                     }
                 else:
                     item["create_response"] = create_shipment_via_api(
@@ -1588,6 +1595,7 @@ def location_search(
     return {
         "result": result_data,
         "capability": CAPABILITY_NAME,
+        "status": "complete",
     }
 
 
@@ -1611,7 +1619,6 @@ def main() -> None:
             config_path=args.get("config_path"),
             location_type=args.get("location_type") or args.get("type", LOCATION_TYPE_BOTH),
             include_commodities=args.get("include_commodities", DEFAULT_INCLUDE_COMMODITIES),
-            transit_time_xlsx_path=args.get("transit_time_xlsx_path"),
             output_csv_path=args.get("output_csv_path"),
         )
         print(json.dumps(result, indent=2))
