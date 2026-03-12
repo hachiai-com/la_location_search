@@ -1414,6 +1414,8 @@ def location_search(
         street_address: Optional[str] = None,
         alias_source: Optional[str] = None,
     ) -> Dict[str, Any]:
+        # Customer / PickUp Company: use request alias_source for Pickup (what we sent), not response
+        pickup_alias = (alias_source or "").strip() if loc_type == "Pickup" and alias_source else None
         out: Dict[str, Any] = {
             "row_index": row_index,
             "id": loc["id"],
@@ -1423,7 +1425,7 @@ def location_search(
             "street_address": street_address or "",
             "error": None,
             "location_name": loc.get("location_name") or "",
-            "alias_source": loc.get("alias_source") or alias_source or "",
+            "alias_source": pickup_alias if pickup_alias else (loc.get("alias_source") or alias_source or ""),
             "commodities": loc.get("commodities") or [],  # temperature_requirement values for LA3/LA6 payload temperature
         }
         return out
