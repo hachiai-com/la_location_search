@@ -344,6 +344,152 @@ def create_shipment_via_api(payload: Dict[str, Any], shipment_config: Dict[str, 
         }
 
 
+def _shipment_api_request(
+    method: str,
+    url: str,
+    shipment_config: Dict[str, Any],
+    json_body: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Shared auth and request for shipment API (search or patch). Returns {status_code, body, success, message}."""
+    region = shipment_config.get("region") or ""
+    service = shipment_config.get("service") or "execute-api"
+    api_key = shipment_config.get("apiKey") or ""
+    access_key = shipment_config.get("accessKey") or ""
+    secret_key = shipment_config.get("secretKey") or ""
+    if not all([url, region, service, api_key, access_key, secret_key]):
+        return {"status_code": 0, "body": "", "success": False, "message": "Shipment API config incomplete"}
+    try:
+        auth = AWS4Auth(access_key, secret_key, region, service)
+        headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+        if method == "POST":
+            resp = requests.post(url, json=json_body or {}, headers=headers, auth=auth, timeout=60)
+        elif method == "PATCH":
+            resp = requests.patch(url, json=json_body or {}, headers=headers, auth=auth, timeout=60)
+        else:
+            return {"status_code": 0, "body": "", "success": False, "message": f"Unsupported method {method}"}
+        return {
+            "status_code": resp.status_code,
+            "body": resp.text,
+            "success": 200 <= resp.status_code < 300,
+            "message": resp.text[:200] if resp.text else "",
+        }
+    except Exception as e:
+        logger.exception("Shipment API %s failed", method)
+        return {"status_code": 0, "body": str(e), "success": False, "message": str(e)}
+
+
+def search_shipment_by_po(purchase_order: Any, shipment_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    POST shipments/search with purchase_order. Returns first shipment dict including shipment_id, or None.
+    Uses shipment_update_api.baseUrl (or shipment_api.search_base_url/baseUrl) + 'shipments/search'.
+    """
+    base = (shipment_config.get("baseUrl") or shipment_config.get("search_base_url") or "").strip().rstrip("/")
+    if not base:
+        return None
+    url = f"{base}/shipments/search"
+    po_val = str(purchase_order).strip() if purchase_order is not None else ""
+    if not po_val:
+        return None
+    out = _shipment_api_request("POST", url, shipment_config, json_body={"purchase_order": int(po_val) if po_val.isdigit() else po_val})
+    if not out.get("success") or not out.get("body"):
+        return None
+    try:
+        data = json.loads(out["body"])
+        shipments = data.get("shipments") or []
+        if not shipments:
+            return None
+        first = shipments[0]
+        first["shipment_id"] = first.get("shipment_id")
+        return first
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _norm_shipment_val(v: Any) -> Any:
+    """Normalize for comparison: treat int/float/str same for ids and numbers."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return v if isinstance(v, bool) is False else v
+    s = str(v).strip()
+    if s.isdigit():
+        return int(s)
+    try:
+        return float(s)
+    except ValueError:
+        return s
+
+
+# Fields we compare between our payload (json1) and existing shipment (json2); parent path in json1.
+_DUPLICATE_COMPARE = [
+    ("dates", "pickup_date", ["dates", "pickup_date"]),
+    ("dates", "delivery_date", ["dates", "delivery_date"]),
+    ("quantities", "weight", ["quantities", "declared", "weight"]),
+    ("quantities", "cube", ["quantities", "declared", "cube"]),
+    ("quantities", "cases", ["quantities", "declared", "cases"]),
+    ("quantities", "lifts", ["quantities", "declared", "lifts"]),
+    ("quantities", "pallets", ["quantities", "declared", "pallets"]),
+    ("locations", "origin", ["locations", "origin"]),
+    ("locations", "destination", ["locations", "destination"]),
+    ("parties", "customer", ["parties", "customer"]),
+    ("parties", "client", ["parties", "client"]),
+    ("service", "mode", ["service", "mode"]),
+    ("service", "service", ["service", "service"]),
+    ("service", "temperature", ["service", "temperature"]),
+]
+
+
+def _get_nested(d: Dict[str, Any], path: List[str]) -> Any:
+    for k in path:
+        d = (d or {}).get(k)
+    return d
+
+
+def _set_nested(d: Dict[str, Any], path: List[str], value: Any) -> None:
+    for k in path[:-1]:
+        if k not in d:
+            d[k] = {}
+        d = d[k]
+    if path:
+        d[path[-1]] = value
+
+
+def build_patch_payload_for_duplicate(json1: Dict[str, Any], json2: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compare json1 (our payload) vs json2 (existing shipment from search). Return PATCH payload with only
+    changed fields, using json1's parent structure (dates, quantities, locations, parties, service).
+    For quantities we send both declared and current from json1 when any quantity field differs.
+    """
+    patch: Dict[str, Any] = {}
+    quantities_differ = False
+    for parent, key, path in _DUPLICATE_COMPARE:
+        v1 = _get_nested(json1, path)
+        v2 = _get_nested(json2, path)
+        if _norm_shipment_val(v1) != _norm_shipment_val(v2):
+            if parent == "quantities":
+                quantities_differ = True
+                continue
+            if parent not in patch:
+                patch[parent] = {}
+            patch[parent][key] = v1
+    if quantities_differ:
+        q1 = json1.get("quantities") or {}
+        patch["quantities"] = {
+            "declared": dict(q1.get("declared") or {}),
+            "current": dict(q1.get("current") or {}),
+        }
+    return patch
+
+
+def patch_shipment_via_api(shipment_id: Any, patch_payload: Dict[str, Any], shipment_config: Dict[str, Any]) -> Dict[str, Any]:
+    """PATCH shipments/{shipment_id} with patch_payload. Uses shipment_update_api.baseUrl (or baseUrl)."""
+    base = (shipment_config.get("baseUrl") or shipment_config.get("search_base_url") or "").strip().rstrip("/")
+    if not base:
+        return {"status_code": 0, "body": "", "success": False, "message": "Shipment API base URL missing"}
+    url = f"{base}/shipments/{shipment_id}"
+    return _shipment_api_request("PATCH", url, shipment_config, json_body=patch_payload)
+
+
 def search_location(
     access_token: str,
     search_url: str,
@@ -1544,6 +1690,7 @@ def location_search(
 
         # Optional: call shipment create API for each payload if config has shipment_api
         shipment_config = config.get("shipment_api")
+        shipment_update_config = config.get("shipment_update_api") or shipment_config  # for PO search + PATCH when duplicate
         if shipment_config and isinstance(shipment_config, dict):
             for item in payloads:
                 if item.get("cannot_read_address"):
@@ -1580,9 +1727,39 @@ def location_search(
                         "message": msg,
                     }
                 else:
-                    item["create_response"] = create_shipment_via_api(
-                        item.get("payload") or {}, shipment_config
-                    )
+                    payload = item.get("payload") or {}
+                    create_resp = create_shipment_via_api(payload, shipment_config)
+                    item["create_response"] = create_resp
+                    # PO already exists: get existing shipment (json2), compare with our payload (json1), PATCH if any diff
+                    body_str = (create_resp.get("body") or "").strip()
+                    if body_str.startswith("{") and ("SHIP.PO.DUPLICATE" in body_str or "already exists" in (create_resp.get("message") or "").lower()):
+                        try:
+                            root = json.loads(body_str)
+                            if root.get("id") == "SHIP.PO.DUPLICATE" or "already exists" in (root.get("message") or "").lower():
+                                po = payload.get("purchase_order")
+                                existing = search_shipment_by_po(po, shipment_update_config)
+                                if existing:
+                                    shipment_id = existing.get("shipment_id")
+                                    if shipment_id is not None:
+                                        patch_payload = build_patch_payload_for_duplicate(payload, existing)
+                                        if patch_payload:
+                                            patch_resp = patch_shipment_via_api(shipment_id, patch_payload, shipment_update_config)
+                                            if patch_resp.get("success"):
+                                                item["create_response"] = {
+                                                    "status_code": create_resp.get("status_code"),
+                                                    "body": create_resp.get("body"),
+                                                    "success": False,
+                                                    "message": "Duplicate PO - Shipment already exists; patched updates applied",
+                                                    "patch_response": patch_resp,
+                                                }
+                                            else:
+                                                item["create_response"]["message"] = (
+                                                    "Duplicate PO - Shipment already exists; patch failed: " + (patch_resp.get("message") or "")
+                                                )
+                                        else:
+                                            item["create_response"]["message"] = "Duplicate PO - Shipment already exists (no changes)"
+                        except (json.JSONDecodeError, TypeError, KeyError) as e:
+                            logger.warning("PO duplicate follow-up failed: %s", e)
 
         result_data["payloads"] = payloads
 
@@ -1597,7 +1774,13 @@ def location_search(
     return {
         "result": result_data,
         "capability": CAPABILITY_NAME,
+        "================": "================",
+        " ================": "================",
+        "  ================": "================",
         "status": "complete",
+        "=============== ": "================",
+        " ================ ": "================",
+        "  ================ ": "================",
     }
 
 

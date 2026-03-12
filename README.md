@@ -22,6 +22,7 @@ la_location_search/
 - **cognito**: `token_url` (or `cognito_domain`), `client_id`, `client_secret`, `scope` for OAuth2 client_credentials.
 - **location_api**: `search_url` for the location/search API.
 - **shipment_api** (optional): When present, each built payload is POSTed to the shipment create API. Use `region`, `service`, `baseUrl`, `apiKey`, `accessKey`, `secretKey` (AWS4Auth + x-api-key).
+- **shipment_update_api** (optional): When create returns "PO already exists", search and PATCH use this config (same keys; `baseUrl` e.g. `https://rrocilmu02.execute-api.ca-central-1.amazonaws.com/qa/`). If omitted, `shipment_api` is used for search/PATCH.
 - **csv_columns** (optional): Override the CSV column names the toolkit expects. Use this when your CSV uses different headers than the defaults:
   - **alias_value**: column for vendor number (default `vendorno`). Used for Pickup.
   - **street_address**: column for pickup street address (default `shipfrom_street`).
