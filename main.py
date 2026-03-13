@@ -1660,6 +1660,37 @@ def location_search(
                         location_results = [resolved]
                     else:
                         location_results = []
+                # OTR-only fallback: if Pickup with SOBEYS TENDER - OTR returned empty, retry with SOBEYS TENDER - ADMIN
+                if (
+                    run_type == LOCATION_TYPE_PICKUP
+                    and not location_results
+                    and alias_source_val == "SOBEYS TENDER - OTR"
+                    and alias_value_val
+                ):
+                    fallback_request_otr = {
+                        "include_commodities": include_commodities,
+                        "type": run_type,
+                        "alias_source": "SOBEYS TENDER - ADMIN",
+                        "alias_value": str(alias_value_val),
+                    }
+                    fallback_response_otr = search_location(
+                        access_token=access_token,
+                        search_url=search_url,
+                        search_type=run_type,
+                        include_commodities=include_commodities,
+                        street_address=None,
+                        alias_source="SOBEYS TENDER - ADMIN",
+                        alias_value=alias_value_val,
+                    )
+                    api_request_response_by_row[row_index][run_type] = {"request": fallback_request_otr, "response": fallback_response_otr}
+                    location_results = extract_location_results(fallback_response_otr)
+                    alias_for_result = "SOBEYS TENDER - ADMIN"  # so Customer / PickUp Company shows ADMIN when fallback used
+                    if run_type == LOCATION_TYPE_PICKUP and len(location_results) > 1:
+                        resolved = _resolve_pickup_location_by_street_number(location_results, street_val or "")
+                        if resolved is not None:
+                            location_results = [resolved]
+                        else:
+                            location_results = []
                 if not location_results:
                     err_msg = ERROR_EMPTY_LOCATIONS_ADDRESS if (response.get("locations") or []) == [] else "No locations in response"
                     if run_type == LOCATION_TYPE_PICKUP and (response.get("locations") or []):
