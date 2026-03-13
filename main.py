@@ -45,6 +45,10 @@ DELIVERY_SHIPTO_COLUMN = "shipto"  # CSV column for Delivery alias_value (full d
 SOBEYS_DELIVERY_ALIAS_SOURCE = "Sobeys Destination"
 PEPSI_DELIVERY_ALIAS_SOURCE = "Pepsi Destination"
 
+# Hardcoded Delivery override: when description has M&M and shipto is this value, use this alias_value for Delivery API.
+DELIVERY_SHIPTO_M_AND_M_VAUGHAN = "92, Sobeys Vaughan Retail  Support 8265 HUNTINGTON ROAD VAUGHAN, ON, CAN"
+DELIVERY_ALIAS_VALUE_M_AND_M_VAUGHAN = "AMERICOLD (SOBEYS M&M DELIVERIES)"
+
 # Canonical shipto_street lookup for Delivery API: resolve input address to a known-good address from this list.
 # Multi-digit leading number: search by number (e.g. "260199"). Single-digit: search by number + next word (e.g. "1 LEWIS").
 SHIPTO_STREET_LOOKUP_NON_PEPSI = [
@@ -1634,9 +1638,13 @@ def location_search(
                 request_dict["alias_source"] = alias_source_val
                 request_dict["alias_value"] = str(alias_value_val)
             elif run_type == LOCATION_TYPE_DELIVERY:
-                # All Delivery (including RSC40/RSC50): alias only. alias_value = shipto column.
+                # All Delivery (including RSC40/RSC50): alias only. alias_value = shipto column, unless M&M + Vaughan override.
                 delivery_alias_source = PEPSI_DELIVERY_ALIAS_SOURCE if is_pepsi_row else SOBEYS_DELIVERY_ALIAS_SOURCE
-                delivery_alias_value = shipto_val
+                description_val = _cell_str(row.get("description"))
+                if "M&M" in description_val and (shipto_val or "").strip() == DELIVERY_SHIPTO_M_AND_M_VAUGHAN.strip():
+                    delivery_alias_value = DELIVERY_ALIAS_VALUE_M_AND_M_VAUGHAN
+                else:
+                    delivery_alias_value = shipto_val
                 request_dict["alias_source"] = delivery_alias_source
                 request_dict["alias_value"] = delivery_alias_value
             try:
